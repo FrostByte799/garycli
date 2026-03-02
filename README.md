@@ -153,7 +153,7 @@ irm https://www.garycli.com/install.ps1 | iex
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/GaryCLI/gary.git
+git clone https://github.com/PrettyMyGirlZyy4Embedded/garycli.git
 cd gary
 
 # 2. 安装 Python 依赖
