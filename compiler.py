@@ -6,86 +6,167 @@ import subprocess
 from pathlib import Path
 from config import *
 
-# ==================== 芯片参数表 ====================
-# 根据芯片型号自动选择 CPU 核心、Flash/RAM 大小、宏定义、HAL 系列等
-CHIP_DB = {
-    # --- STM32F1 系列 (Cortex-M3) ---
-    "STM32F103C8":  {"cpu": "cortex-m3", "flash_k": 64,  "ram_k": 20,  "define": "STM32F103xB", "family": "f1", "fpu": False},
-    "STM32F103CB":  {"cpu": "cortex-m3", "flash_k": 128, "ram_k": 20,  "define": "STM32F103xB", "family": "f1", "fpu": False},
-    "STM32F103RB":  {"cpu": "cortex-m3", "flash_k": 128, "ram_k": 20,  "define": "STM32F103xB", "family": "f1", "fpu": False},
-    "STM32F103RC":  {"cpu": "cortex-m3", "flash_k": 256, "ram_k": 48,  "define": "STM32F103xE", "family": "f1", "fpu": False},
-    "STM32F103RE":  {"cpu": "cortex-m3", "flash_k": 512, "ram_k": 64,  "define": "STM32F103xE", "family": "f1", "fpu": False},
-    "STM32F103ZE":  {"cpu": "cortex-m3", "flash_k": 512, "ram_k": 64,  "define": "STM32F103xE", "family": "f1", "fpu": False},
-    "STM32F103VE":  {"cpu": "cortex-m3", "flash_k": 512, "ram_k": 64,  "define": "STM32F103xE", "family": "f1", "fpu": False},
-    "STM32F100RB":  {"cpu": "cortex-m3", "flash_k": 128, "ram_k": 8,   "define": "STM32F100xB", "family": "f1", "fpu": False},
-    "STM32F105":    {"cpu": "cortex-m3", "flash_k": 256, "ram_k": 64,  "define": "STM32F105xC", "family": "f1", "fpu": False},
-    "STM32F107":    {"cpu": "cortex-m3", "flash_k": 256, "ram_k": 64,  "define": "STM32F107xC", "family": "f1", "fpu": False},
-    # --- STM32F4 系列 (Cortex-M4F) ---
-    "STM32F401CC":  {"cpu": "cortex-m4", "flash_k": 256, "ram_k": 64,  "define": "STM32F401xC", "family": "f4", "fpu": True},
-    "STM32F401CE":  {"cpu": "cortex-m4", "flash_k": 512, "ram_k": 96,  "define": "STM32F401xE", "family": "f4", "fpu": True},
-    "STM32F407VE":  {"cpu": "cortex-m4", "flash_k": 512, "ram_k": 128, "define": "STM32F407xx", "family": "f4", "fpu": True},
-    "STM32F407VG":  {"cpu": "cortex-m4", "flash_k": 1024,"ram_k": 128, "define": "STM32F407xx", "family": "f4", "fpu": True},
-    "STM32F407ZG":  {"cpu": "cortex-m4", "flash_k": 1024,"ram_k": 128, "define": "STM32F407xx", "family": "f4", "fpu": True},
-    "STM32F411CE":  {"cpu": "cortex-m4", "flash_k": 512, "ram_k": 128, "define": "STM32F411xE", "family": "f4", "fpu": True},
-    "STM32F429ZI":  {"cpu": "cortex-m4", "flash_k": 2048,"ram_k": 256, "define": "STM32F429xx", "family": "f4", "fpu": True},
-    "STM32F446RE":  {"cpu": "cortex-m4", "flash_k": 512, "ram_k": 128, "define": "STM32F446xx", "family": "f4", "fpu": True},
-    # --- STM32F0 系列 (Cortex-M0) ---
-    "STM32F030F4":  {"cpu": "cortex-m0", "flash_k": 16,  "ram_k": 4,   "define": "STM32F030x6", "family": "f0", "fpu": False},
-    "STM32F030C8":  {"cpu": "cortex-m0", "flash_k": 64,  "ram_k": 8,   "define": "STM32F030x8", "family": "f0", "fpu": False},
-    "STM32F072RB":  {"cpu": "cortex-m0", "flash_k": 128, "ram_k": 16,  "define": "STM32F072xB", "family": "f0", "fpu": False},
-    # --- STM32F3 系列 (Cortex-M4F) ---
-    "STM32F303CC":  {"cpu": "cortex-m4", "flash_k": 256, "ram_k": 40,  "define": "STM32F303xC", "family": "f3", "fpu": True},
-    "STM32F303RE":  {"cpu": "cortex-m4", "flash_k": 512, "ram_k": 64,  "define": "STM32F303xE", "family": "f3", "fpu": True},
+# ==================== FreeRTOS 支持 ====================
+
+# 各 CPU family 对应的 FreeRTOS GCC port 目录名
+_RTOS_PORT = {
+    "f0": "ARM_CM0",
+    "f1": "ARM_CM3",
+    "f3": "ARM_CM4F",
+    "f4": "ARM_CM4F",
 }
 
-# 各系列 IRQ 处理函数名称表（按向量位置排列，None = 保留位填 0）
-# 使用具名 weak 别名，C 代码里定义同名函数即可覆盖
-
-_F1_IRQ_NAMES = [
-    "WWDG_IRQHandler",            "PVD_IRQHandler",             # 0-1
-    "TAMPER_IRQHandler",          "RTC_IRQHandler",             # 2-3
-    "FLASH_IRQHandler",           "RCC_IRQHandler",             # 4-5
-    "EXTI0_IRQHandler",           "EXTI1_IRQHandler",           # 6-7
-    "EXTI2_IRQHandler",           "EXTI3_IRQHandler",           # 8-9
-    "EXTI4_IRQHandler",                                         # 10
-    "DMA1_Channel1_IRQHandler",   "DMA1_Channel2_IRQHandler",  # 11-12
-    "DMA1_Channel3_IRQHandler",   "DMA1_Channel4_IRQHandler",  # 13-14
-    "DMA1_Channel5_IRQHandler",   "DMA1_Channel6_IRQHandler",  # 15-16
-    "DMA1_Channel7_IRQHandler",   "ADC1_2_IRQHandler",         # 17-18
-    "USB_HP_CAN1_TX_IRQHandler",  "USB_LP_CAN1_RX0_IRQHandler",# 19-20
-    "CAN1_RX1_IRQHandler",        "CAN1_SCE_IRQHandler",        # 21-22
-    "EXTI9_5_IRQHandler",                                       # 23
-    "TIM1_BRK_IRQHandler",        "TIM1_UP_IRQHandler",         # 24-25
-    "TIM1_TRG_COM_IRQHandler",    "TIM1_CC_IRQHandler",         # 26-27
-    "TIM2_IRQHandler",            "TIM3_IRQHandler",            # 28-29
-    "TIM4_IRQHandler",                                          # 30
-    "I2C1_EV_IRQHandler",         "I2C1_ER_IRQHandler",         # 31-32
-    "I2C2_EV_IRQHandler",         "I2C2_ER_IRQHandler",         # 33-34
-    "SPI1_IRQHandler",            "SPI2_IRQHandler",            # 35-36
-    "USART1_IRQHandler",          "USART2_IRQHandler",          # 37-38
-    "USART3_IRQHandler",          "EXTI15_10_IRQHandler",       # 39-40
-    "RTC_Alarm_IRQHandler",       "USBWakeUp_IRQHandler",       # 41-42
-    "TIM8_BRK_IRQHandler",        "TIM8_UP_IRQHandler",         # 43-44
-    "TIM8_TRG_COM_IRQHandler",    "TIM8_CC_IRQHandler",         # 45-46
-    "ADC3_IRQHandler",            "FSMC_IRQHandler",            # 47-48
-    "SDIO_IRQHandler",            "TIM5_IRQHandler",            # 49-50
-    "SPI3_IRQHandler",            "UART4_IRQHandler",           # 51-52
-    "UART5_IRQHandler",           "TIM6_IRQHandler",            # 53-54
-    "TIM7_IRQHandler",                                          # 55
-    "DMA2_Channel1_IRQHandler",   "DMA2_Channel2_IRQHandler",  # 56-57
-    "DMA2_Channel3_IRQHandler",   "DMA2_Channel4_5_IRQHandler",# 58-59
-    None, None, None, None, None, None, None, None,             # 60-67 保留
+# FreeRTOS Kernel 核心源文件（位于 kernel 根目录）
+_FREERTOS_CORE_FILES = [
+    "tasks.c", "queue.c", "list.c",
+    "timers.c", "event_groups.c", "stream_buffer.c",
 ]
 
-# F0 中断名与 F1 差异很大：EXTI 合并、TIM 组合等
-_F0_IRQ_NAMES = [
-    "WWDG_IRQHandler",                "PVD_VDDIO2_IRQHandler",          # 0-1"""
-FlashTalk 编译器 - STM32 交叉编译 + 多芯片适配 + HAL 库自动检测
+
+def _find_freertos_root() -> Path:
+    """在 RTOS_DIR 下查找 FreeRTOS Kernel 根目录（包含 tasks.c 即可认定）"""
+    if not RTOS_DIR.exists():
+        return None
+    for d in RTOS_DIR.iterdir():
+        if d.is_dir() and (d / "tasks.c").exists():
+            return d
+    return None
+
+
+def _chip_clock_hz(chip_info: dict) -> int:
+    """根据芯片 define 推算最大系统时钟（Hz）"""
+    define = chip_info.get("define", "")
+    if "F411" in define or "F401" in define:
+        return 100_000_000   # STM32F401/F411 最高 100 MHz
+    if "F407" in define or "F429" in define or "F446" in define:
+        return 168_000_000
+    if "F4" in define:
+        return 100_000_000
+    if "F103" in define or "F1" in define:
+        return 72_000_000
+    return 48_000_000
+
+
+def _gen_freertos_config(chip_info: dict) -> str:
+    """根据芯片参数生成 FreeRTOSConfig.h"""
+    cpu    = chip_info["cpu"]
+    ram_k  = chip_info["ram_k"]
+    # 最多用 1/3 RAM 给 FreeRTOS heap，上限 32 KB
+    heap_b = min(ram_k * 1024 // 3, 32768)
+
+    # Cortex-M 优先级位数
+    prio_bits = 4 if cpu in ("cortex-m3", "cortex-m4") else 2
+
+    return f"""/* FreeRTOSConfig.h - Auto-generated by Gary Dev Agent */
+#ifndef FREERTOS_CONFIG_H
+#define FREERTOS_CONFIG_H
+
+#include <stdint.h>
+extern uint32_t SystemCoreClock;
+
+/* ---- Scheduler ---- */
+#define configUSE_PREEMPTION                    1
+#define configUSE_TIME_SLICING                  1
+#define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
+
+/* ---- Clock ---- */
+#define configCPU_CLOCK_HZ                      ( SystemCoreClock )
+#define configTICK_RATE_HZ                      ( ( TickType_t ) 1000 )
+
+/* ---- Tasks ---- */
+#define configMAX_PRIORITIES                    ( 5 )
+#define configMINIMAL_STACK_SIZE                ( ( uint16_t ) 128 )
+#define configMAX_TASK_NAME_LEN                 ( 12 )
+#define configIDLE_SHOULD_YIELD                 1
+
+/* ---- Memory ---- */
+#define configSUPPORT_STATIC_ALLOCATION         0
+#define configSUPPORT_DYNAMIC_ALLOCATION        1
+#define configTOTAL_HEAP_SIZE                   ( ( size_t )( {heap_b} ) )
+#define configAPPLICATION_ALLOCATED_HEAP        0
+
+/* ---- Hooks ---- */
+/* vApplicationTickHook 内调用 HAL_IncTick()，维持 HAL 时基 */
+#define configUSE_TICK_HOOK                     1
+#define configUSE_IDLE_HOOK                     0
+#define configUSE_MALLOC_FAILED_HOOK            1
+#define configCHECK_FOR_STACK_OVERFLOW          2
+
+/* ---- SW Timers ---- */
+#define configUSE_TIMERS                        1
+#define configTIMER_TASK_PRIORITY               ( configMAX_PRIORITIES - 1 )
+#define configTIMER_QUEUE_LENGTH                8
+#define configTIMER_TASK_STACK_DEPTH            ( configMINIMAL_STACK_SIZE * 2 )
+
+/* ---- Sync primitives ---- */
+#define configUSE_MUTEXES                       1
+#define configUSE_RECURSIVE_MUTEXES             1
+#define configUSE_COUNTING_SEMAPHORES           1
+#define configUSE_QUEUE_SETS                    0
+#define configQUEUE_REGISTRY_SIZE               8
+
+/* ---- Stats / Trace ---- */
+#define configGENERATE_RUN_TIME_STATS           0
+#define configUSE_TRACE_FACILITY                0
+#define configUSE_STATS_FORMATTING_FUNCTIONS    0
+
+/* ---- Co-routines ---- */
+#define configUSE_CO_ROUTINES                   0
+
+/* ---- Interrupt priorities (Cortex-M) ---- */
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY     15
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+#define configKERNEL_INTERRUPT_PRIORITY  ( configLIBRARY_LOWEST_INTERRUPT_PRIORITY << ( 8 - {prio_bits} ) )
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY ( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << ( 8 - {prio_bits} ) )
+
+/* ---- API includes ---- */
+#define INCLUDE_vTaskPrioritySet                1
+#define INCLUDE_uxTaskPriorityGet               1
+#define INCLUDE_vTaskDelete                     1
+#define INCLUDE_vTaskSuspend                    1
+#define INCLUDE_xResumeFromISR                  1
+#define INCLUDE_vTaskDelayUntil                 1
+#define INCLUDE_vTaskDelay                      1
+#define INCLUDE_xTaskGetSchedulerState          1
+#define INCLUDE_xTaskGetCurrentTaskHandle       1
+#define INCLUDE_uxTaskGetStackHighWaterMark     1
+#define INCLUDE_xTaskGetIdleTaskHandle          0
+#define INCLUDE_eTaskGetState                   1
+#define INCLUDE_xTimerPendFunctionCall          1
+#define INCLUDE_xTaskAbortDelay                 1
+#define INCLUDE_xTaskGetHandle                  1
+
+/* ---- Map FreeRTOS exception names to CMSIS/HAL names ---- */
+#define xPortPendSVHandler  PendSV_Handler
+#define xPortSysTickHandler SysTick_Handler
+#define vPortSVCHandler     SVC_Handler
+
+#endif /* FREERTOS_CONFIG_H */
 """
 
-import subprocess
-from pathlib import Path
-from config import *
+
+def _gen_linker_script_rtos(flash_k: int, ram_k: int) -> str:
+    """带 FreeRTOS 的链接脚本（适当增大 main stack，heap 由 heap_4.c 内部管理）"""
+    return f"""MEMORY {{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = {flash_k}K
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = {ram_k}K
+}}
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+_Min_Heap_Size  = 0x400;   /* 1 KB C heap（heap_4.c 内部独立维护，此处只占位） */
+_Min_Stack_Size = 0x800;   /* 2 KB main/ISR stack（调度器启动前使用） */
+SECTIONS {{
+  .isr_vector : {{ KEEP(*(.isr_vector)) }} >FLASH
+  .text : {{ *(.text*) *(.rodata*) . = ALIGN(4); _etext = .; }} >FLASH
+  .init : {{ KEEP(*(.init)) }} >FLASH
+  .fini : {{ KEEP(*(.fini)) }} >FLASH
+  .init_array : {{ KEEP(*(.init_array*)) }} >FLASH
+  .fini_array : {{ KEEP(*(.fini_array*)) }} >FLASH
+  .data : AT(_etext) {{ _sdata = .; *(.data*) . = ALIGN(4); _edata = .; }} >RAM
+  .bss : {{ _sbss = .; *(.bss*) *(COMMON) . = ALIGN(4); _ebss = .; }} >RAM
+  ._user_heap_stack : {{ . = ALIGN(8); . = . + _Min_Heap_Size; . = . + _Min_Stack_Size; . = ALIGN(8); }} >RAM
+  /DISCARD/ : {{ *(.ARM.*) }}
+}}
+"""
 
 # ==================== 芯片参数表 ====================
 # 根据芯片型号自动选择 CPU 核心、Flash/RAM 大小、宏定义、HAL 系列等
@@ -740,5 +821,128 @@ class Compiler:
                 return {"ok": False, "msg": short, "bin_path": None, "bin_size": 0}
         except subprocess.TimeoutExpired:
             return {"ok": False, "msg": "编译超时", "bin_path": None, "bin_size": 0}
+        except Exception as e:
+            return {"ok": False, "msg": str(e), "bin_path": None, "bin_size": 0}
+
+    def compile_rtos(self, code: str) -> dict:
+        """编译带 FreeRTOS 内核的 C 代码，返回 {ok, msg, bin_path, bin_size}"""
+        if self._chip_info is None:
+            self.set_chip(DEFAULT_CHIP)
+
+        ci     = self._chip_info
+        family = self._current_family or "f1"
+
+        # ── 查找 FreeRTOS 内核 ──────────────────────────────────────
+        rtos_root = _find_freertos_root()
+        if rtos_root is None:
+            return {
+                "ok": False,
+                "msg": "FreeRTOS 内核未下载，请运行 python setup.py --rtos 下载",
+                "bin_path": None, "bin_size": 0,
+            }
+
+        port_dir_name = _RTOS_PORT.get(family, "ARM_CM3")
+        port_path     = rtos_root / "portable" / "GCC" / port_dir_name
+        heap_path     = rtos_root / "portable" / "MemMang" / "heap_4.c"
+
+        if not port_path.exists():
+            return {
+                "ok": False,
+                "msg": f"FreeRTOS port 目录不存在: {port_path}",
+                "bin_path": None, "bin_size": 0,
+            }
+
+        # ── 生成辅助文件 ─────────────────────────────────────────────
+        (BUILD_DIR / "FreeRTOSConfig.h").write_text(_gen_freertos_config(ci))
+        (BUILD_DIR / "link.ld").write_text(_gen_linker_script_rtos(ci["flash_k"], ci["ram_k"]))
+
+        main_c = BUILD_DIR / "main.c"
+        main_c.write_text(code)
+        elf  = BUILD_DIR / "firmware.elf"
+        binf = BUILD_DIR / "firmware.bin"
+        for f in [elf, binf]:
+            f.unlink(missing_ok=True)
+
+        if not self.has_gcc:
+            return {"ok": False, "msg": "arm-none-eabi-gcc 未安装", "bin_path": None, "bin_size": 0}
+
+        # ── 编译参数 ─────────────────────────────────────────────────
+        cpu_flags = [f"-mcpu={ci['cpu']}", "-mthumb"]
+        if ci["fpu"]:
+            cpu_flags += ["-mfloat-abi=hard", "-mfpu=fpv4-sp-d16"]
+
+        # FreeRTOS 源文件
+        rtos_srcs = []
+        for fname in _FREERTOS_CORE_FILES:
+            fp = rtos_root / fname
+            if fp.exists():
+                rtos_srcs.append(str(fp))
+        port_c = port_path / "port.c"
+        if port_c.exists():
+            rtos_srcs.append(str(port_c))
+        if heap_path.exists():
+            rtos_srcs.append(str(heap_path))
+
+        # Include 目录：HAL + FreeRTOS include + port + BUILD_DIR（FreeRTOSConfig.h）
+        rtos_inc_dirs = [
+            str(rtos_root / "include"),
+            str(port_path),
+            str(BUILD_DIR),
+        ]
+        all_inc = [f"-I{d}" for d in self.hal_inc_dirs + rtos_inc_dirs]
+
+        if self.has_hal:
+            if self.has_hal_lib:
+                extra_srcs = rtos_srcs
+                extra_libs = [f"-L{BUILD_DIR}", f"-lstm32hal_{family}"]
+            else:
+                extra_srcs = rtos_srcs + self.hal_src_files
+                extra_libs = []
+
+            cmd = [
+                ARM_GCC,
+                *cpu_flags,
+                f"-D{ci['define']}", "-DUSE_HAL_DRIVER",
+                *all_inc,
+                "-Os", "-Wall", "-Wno-unused-variable", "-Wno-unused-function",
+                "-ffunction-sections", "-fdata-sections",
+                f"-T{BUILD_DIR / 'link.ld'}",
+                "-Wl,--gc-sections",
+                str(main_c),
+                str(BUILD_DIR / "startup.s"),
+                *extra_srcs,
+                "-o", str(elf),
+                "-nostartfiles",
+                *extra_libs,
+                "-lc", "-lm", "-lnosys",
+            ]
+            if self.has_specs:
+                cmd += ["--specs=nosys.specs", "--specs=nano.specs"]
+        else:
+            # 无 HAL：仅语法检查
+            cmd = [
+                ARM_GCC, *cpu_flags, f"-D{ci['define']}",
+                *all_inc,
+                "-fsyntax-only", "-Wall", str(main_c),
+            ]
+
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                if self.has_hal and elf.exists():
+                    subprocess.run([ARM_OBJCOPY, "-O", "binary", str(elf), str(binf)], timeout=10)
+                    sz = binf.stat().st_size if binf.exists() else 0
+                    return {"ok": True, "msg": f"RTOS 编译成功 ({sz}B)", "bin_path": str(binf), "bin_size": sz}
+                return {"ok": True, "msg": "语法检查通过(无HAL)", "bin_path": None, "bin_size": 0}
+            else:
+                err_txt = r.stderr
+                lines = [l for l in err_txt.split('\n')
+                         if any(k in l for k in ['error:', 'undefined reference', 'multiple definition',
+                                                   'cannot find', 'No such file', 'fatal:'])]
+                lines = [l for l in lines if 'collect2:' not in l] or lines
+                short = '\n'.join(lines[:15]) if lines else err_txt[:1000]
+                return {"ok": False, "msg": short, "bin_path": None, "bin_size": 0}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "msg": "RTOS 编译超时（FreeRTOS 源文件较多，请稍候重试）", "bin_path": None, "bin_size": 0}
         except Exception as e:
             return {"ok": False, "msg": str(e), "bin_path": None, "bin_size": 0}
