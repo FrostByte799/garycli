@@ -9,6 +9,11 @@ STM32 Agent 配置文件（云端优先）
 import os
 from pathlib import Path
 
+# ================= 网络代理 =================
+# 国内服务商（智谱/DeepSeek/通义千问）不需要代理，注释掉即可
+# os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+# os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+# os.environ["GRPC_PROXY_EXP"] = "http://127.0.0.1:7890"
 
 AI_TEMPERATURE = 1  # 低温度保证代码稳定性
 
@@ -24,6 +29,7 @@ WORKSPACE = BASE_DIR / "workspace"
 BUILD_DIR = WORKSPACE / "build"
 PROJECTS_DIR = WORKSPACE / "projects"
 HAL_DIR = WORKSPACE / "hal"
+RTOS_DIR = WORKSPACE / "rtos"
 
 # ================= 单机遗留参数（兼容旧版） =================
 SWDIO_GPIO = 72   # 物理 Pin 18 → STM32 SWDIO (PA13)
