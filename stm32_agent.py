@@ -21,10 +21,13 @@ AI 前端  ：流式对话 + 函数调用工具链
   python3 stm32_agent.py --chip STM32F407VET6   # 指定芯片
 """
 
+import atexit
+import signal
 import sys, os, json, re, time, shutil, subprocess, threading, shlex
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any
+import requests
 from stm32_extra_tools import EXTRA_TOOLS_MAP, EXTRA_TOOL_SCHEMAS
 from gary_skills import (
     init_skills, handle_skill_command,
@@ -47,22 +50,34 @@ from rich.rule import Rule
 from rich import box
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.styles import Style
-from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 
 from openai import OpenAI
 
 # Flash 项目内部模块
-from config import (
-    AI_API_KEY, AI_BASE_URL, AI_MODEL, AI_TEMPERATURE,
-    WORKSPACE, BUILD_DIR, PROJECTS_DIR,
-    DEFAULT_CHIP, DEFAULT_CLOCK,
-    SERIAL_PORT, SERIAL_BAUD,
-    POST_FLASH_DELAY, REGISTER_READ_DELAY,
-)
+import config as _cfg
 import compiler as _compiler_module
 Compiler = _compiler_module.Compiler
+
+AI_API_KEY = getattr(_cfg, "AI_API_KEY", "")
+AI_BASE_URL = getattr(_cfg, "AI_BASE_URL", "https://api.openai.com/v1")
+AI_MODEL = getattr(_cfg, "AI_MODEL", "gpt-4o")
+AI_TEMPERATURE = getattr(_cfg, "AI_TEMPERATURE", 1)
+
+WORKSPACE = _cfg.WORKSPACE
+BUILD_DIR = _cfg.BUILD_DIR
+PROJECTS_DIR = _cfg.PROJECTS_DIR
+DEFAULT_CHIP = getattr(_cfg, "DEFAULT_CHIP", "")
+DEFAULT_CLOCK = getattr(_cfg, "DEFAULT_CLOCK", "HSI_internal")
+CLI_LANGUAGE = getattr(_cfg, "CLI_LANGUAGE", "zh")
+SERIAL_PORT = getattr(_cfg, "SERIAL_PORT", "")
+SERIAL_BAUD = getattr(_cfg, "SERIAL_BAUD", 115200)
+POST_FLASH_DELAY = getattr(_cfg, "POST_FLASH_DELAY", 1.5)
+REGISTER_READ_DELAY = getattr(_cfg, "REGISTER_READ_DELAY", 0.3)
 
 # ─────────────────────────────────────────────────────────────
 # AI 接口管理（动态读写 config.py，支持运行时切换）
@@ -79,45 +94,1779 @@ _AI_PRESETS = [
     ("自定义 / Other",        "",                                                           ""),
 ]
 
+_CONFIG_KEYS_TO_RELOAD = (
+    "AI_API_KEY",
+    "AI_BASE_URL",
+    "AI_MODEL",
+    "AI_TEMPERATURE",
+    "DEFAULT_CHIP",
+    "DEFAULT_CLOCK",
+    "CLI_LANGUAGE",
+    "SERIAL_PORT",
+    "SERIAL_BAUD",
+    "POST_FLASH_DELAY",
+    "REGISTER_READ_DELAY",
+)
+
+
+def _parse_cli_language(value: Any, default: Optional[str] = None) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"en", "eng", "english", "英文"}:
+        return "en"
+    if raw in {"zh", "cn", "zh-cn", "zh_cn", "chinese", "中文"}:
+        return "zh"
+    return None
+
+
+def _normalize_cli_language(value: Any) -> str:
+    return _parse_cli_language(value, default="zh") or "zh"
+
+
+CLI_LANGUAGE = _normalize_cli_language(CLI_LANGUAGE)
+
+
+def _is_cli_english() -> bool:
+    return CLI_LANGUAGE == "en"
+
+
+def _cli_text(zh: str, en: str) -> str:
+    return en if _is_cli_english() else zh
+
+
+def _upsert_config_assignment(text: str, key: str, value: Any) -> str:
+    line = f"{key} = {json.dumps(value, ensure_ascii=False)}"
+    pattern = rf"^{key}\s*=.*$"
+    if re.search(pattern, text, re.MULTILINE):
+        return re.sub(pattern, line, text, flags=re.MULTILINE)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + line + "\n"
+
 def _read_ai_config() -> tuple:
     """从 config.py 读取 (api_key, base_url, model)"""
     p = _HERE / "config.py"
     if not p.exists():
-        return "", "", ""
+        return AI_API_KEY, AI_BASE_URL, AI_MODEL
     text = p.read_text(encoding="utf-8")
     def _get(pat):
         m = re.search(pat, text, re.MULTILINE)
         return m.group(1).strip() if m else ""
     return (
-        _get(r'^AI_API_KEY\s*=\s*["\']([^"\']*)["\']'),
-        _get(r'^AI_BASE_URL\s*=\s*["\']([^"\']*)["\']'),
-        _get(r'^AI_MODEL\s*=\s*["\']([^"\']*)["\']'),
+        _get(r'^AI_API_KEY\s*=\s*["\']([^"\']*)["\']') or AI_API_KEY,
+        _get(r'^AI_BASE_URL\s*=\s*["\']([^"\']*)["\']') or AI_BASE_URL,
+        _get(r'^AI_MODEL\s*=\s*["\']([^"\']*)["\']') or AI_MODEL,
     )
 
-def _write_ai_config(api_key: str, base_url: str, model: str) -> bool:
-    """原地修改 config.py 的三行 AI 配置"""
+def _write_config_assignments(updates: Dict[str, Any]) -> bool:
+    """原地修改 config.py 中的若干配置项"""
     p = _HERE / "config.py"
     if not p.exists():
         return False
     text = p.read_text(encoding="utf-8")
-    text = re.sub(r'^(AI_API_KEY\s*=\s*).*$',  f'AI_API_KEY = "{api_key}"',  text, flags=re.MULTILINE)
-    text = re.sub(r'^(AI_BASE_URL\s*=\s*).*$', f'AI_BASE_URL = "{base_url}"', text, flags=re.MULTILINE)
-    text = re.sub(r'^(AI_MODEL\s*=\s*).*$',    f'AI_MODEL = "{model}"',       text, flags=re.MULTILINE)
+    for key, value in updates.items():
+        text = _upsert_config_assignment(text, key, value)
     p.write_text(text, encoding="utf-8")
     return True
+
+
+def _write_ai_config(api_key: str, base_url: str, model: str) -> bool:
+    """原地修改 config.py 的三行 AI 配置"""
+    return _write_config_assignments({
+        "AI_API_KEY": api_key,
+        "AI_BASE_URL": base_url,
+        "AI_MODEL": model,
+    })
+
+
+def _write_cli_language_config(language: str) -> bool:
+    return _write_config_assignments({
+        "CLI_LANGUAGE": _normalize_cli_language(language),
+    })
 
 def _reload_ai_globals():
     """写入 config.py 后重新加载 AI 相关全局变量"""
     import importlib, config as _cfg
     importlib.reload(_cfg)
-    for name in ("AI_API_KEY", "AI_BASE_URL", "AI_MODEL", "AI_TEMPERATURE"):
-        if hasattr(_cfg, name):
-            globals()[name] = getattr(_cfg, name)
+    defaults = {
+        "AI_API_KEY": "",
+        "AI_BASE_URL": "https://api.openai.com/v1",
+        "AI_MODEL": "gpt-4o",
+        "AI_TEMPERATURE": 1,
+        "DEFAULT_CHIP": "",
+        "DEFAULT_CLOCK": "HSI_internal",
+        "CLI_LANGUAGE": "zh",
+        "SERIAL_PORT": "",
+        "SERIAL_BAUD": 115200,
+        "POST_FLASH_DELAY": 1.5,
+        "REGISTER_READ_DELAY": 0.3,
+    }
+    for name in _CONFIG_KEYS_TO_RELOAD:
+        globals()[name] = getattr(_cfg, name, defaults[name])
+    globals()["CLI_LANGUAGE"] = _normalize_cli_language(globals().get("CLI_LANGUAGE", "zh"))
 
 def _mask_key(key: str) -> str:
     if not key:
         return "(未设置)"
     return key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
+
+
+def _api_key_is_placeholder(api_key: str) -> bool:
+    key = (api_key or "").strip()
+    if not key:
+        return True
+    placeholder_prefixes = ("YOUR_API_KEY", "sk-YOUR")
+    return any(key.startswith(prefix) for prefix in placeholder_prefixes)
+
+
+def _ai_is_configured() -> bool:
+    api_key, base_url, model = _read_ai_config()
+    return bool(
+        api_key
+        and base_url
+        and model
+        and not _api_key_is_placeholder(api_key)
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Gary member.md 经验库（自动记忆 + 系统提示注入）
+# ─────────────────────────────────────────────────────────────
+MEMBER_MD_PATH = _HERE / "member.md"
+MEMBER_PROMPT_CHAR_LIMIT = 12000
+MEMBER_PROMPT_MAX_DYNAMIC = 24
+MEMBER_MAX_FILE_CHARS = 40000
+MEMBER_MAX_DYNAMIC_ENTRIES = 120
+_MEMBER_LOCK = threading.RLock()
+
+
+def _default_member_content() -> str:
+    return """# Gary Member Memory
+
+## Focus
+- 这里只记录高价值、可复用、能提高成功率的经验。
+- 自动写入：成功编译、成功运行闭环。
+- 主动写入：遇到关键初始化顺序、硬件坑、寄存器判定经验、稳定模板时，调用 `gary_save_member_memory`。
+- 经验必须短、具体、可执行，不要粘贴大段原始日志。
+
+## Memories
+
+### [Pinned] 启动标记优先
+- UART 初始化后立刻打印 `Gary:BOOT`，再初始化 I2C/SPI/TIM/OLED 等外设。
+- 这样即使后续外设卡死，也能先确认程序已启动。
+
+### [Pinned] 裸机 HAL_Delay 依赖 SysTick_Handler
+- 裸机代码必须定义 `void SysTick_Handler(void) { HAL_IncTick(); }`。
+- 否则 `HAL_Delay()` 会永久阻塞。
+
+### [Pinned] I2C 外设先探测再使用
+- 初始化后先 `HAL_I2C_IsDeviceReady()` 检查从设备是否应答。
+- 无应答优先怀疑接线或地址，不要盲改业务逻辑。
+
+### [Pinned] 增量修改优先精确替换
+- 修改已有工程时优先 `str_replace_edit` + `stm32_recompile`。
+- 不要无必要地整文件重写。
+
+### [Pinned] 裸机禁止 sprintf/printf/malloc
+- 裸机项目优先手写轻量调试输出，避免 `_sbrk/end` 链接错误。
+"""
+
+
+def _ensure_member_file() -> Path:
+    with _MEMBER_LOCK:
+        if not MEMBER_MD_PATH.exists():
+            MEMBER_MD_PATH.write_text(_default_member_content(), encoding="utf-8")
+    return MEMBER_MD_PATH
+
+
+def _normalize_member_text(value: Any, limit: int = 220) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -\t\r\n")
+    if len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _member_text_to_lines(value: Any, per_line_limit: int = 220, max_lines: int = 8) -> list[str]:
+    source = str(value or "").replace("\r", "\n")
+    lines = []
+    for raw in source.splitlines():
+        line = _normalize_member_text(raw, limit=per_line_limit)
+        if line:
+            lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    if not lines:
+        single = _normalize_member_text(source, limit=per_line_limit)
+        if single:
+            lines.append(single)
+    return lines
+
+
+def _split_member_content(text: str) -> tuple[str, list[str]]:
+    source = (text or "").strip()
+    if not source:
+        source = _default_member_content().strip()
+    if "## Memories" not in source:
+        source = _default_member_content().strip() + "\n\n" + source
+    before, _, after = source.partition("## Memories")
+    header = before.rstrip() + "\n\n## Memories\n"
+    entries = [chunk.strip() for chunk in re.split(r"(?m)(?=^### )", after.strip()) if chunk.strip()]
+    return header, entries
+
+
+def _prune_member_content(text: str) -> str:
+    header, entries = _split_member_content(text)
+    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
+    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
+    dynamic = dynamic[-MEMBER_MAX_DYNAMIC_ENTRIES:]
+
+    kept = []
+    total = len(header)
+    for entry in pinned:
+        needed = len(entry) + 2
+        if kept and total + needed > MEMBER_MAX_FILE_CHARS:
+            break
+        kept.append(entry)
+        total += needed
+
+    recent = []
+    for entry in reversed(dynamic):
+        needed = len(entry) + 2
+        if recent and total + needed > MEMBER_MAX_FILE_CHARS:
+            break
+        recent.append(entry)
+        total += needed
+    recent.reverse()
+    kept.extend(recent)
+
+    content = header.rstrip() + "\n\n" + "\n\n".join(kept).strip()
+    return content.strip() + "\n"
+
+
+def _append_member_memory(
+    title: str,
+    experience: str,
+    tags: Optional[list[str]] = None,
+    source: str = "manual",
+    importance: str = "high",
+) -> dict:
+    clean_title = _normalize_member_text(title, limit=120)
+    lines = _member_text_to_lines(experience, per_line_limit=220, max_lines=10)
+    if not clean_title or not lines:
+        return {"success": False, "message": "title 或 experience 为空"}
+
+    tags = [
+        _normalize_member_text(tag, limit=24)
+        for tag in (tags or [])
+        if _normalize_member_text(tag, limit=24)
+    ][:10]
+    source = _normalize_member_text(source, limit=40) or "manual"
+    importance = _normalize_member_text(importance, limit=16) or "high"
+
+    fingerprint = _normalize_member_text(clean_title + " " + " ".join(lines), limit=500).lower()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry_lines = [f"### [{timestamp}] {clean_title}", f"- importance: {importance}", f"- source: {source}"]
+    if tags:
+        entry_lines.append(f"- tags: {', '.join(tags)}")
+    entry_lines.extend(f"- {line}" for line in lines)
+    entry = "\n".join(entry_lines)
+
+    with _MEMBER_LOCK:
+        path = _ensure_member_file()
+        current = path.read_text(encoding="utf-8")
+        normalized_current = re.sub(r"\s+", " ", current).lower()
+        if fingerprint and fingerprint in normalized_current:
+            return {
+                "success": True,
+                "deduplicated": True,
+                "path": str(path),
+                "message": f"member.md 已存在相似经验: {clean_title}",
+            }
+        updated = _prune_member_content(current.rstrip() + "\n\n" + entry + "\n")
+        path.write_text(updated, encoding="utf-8")
+    return {
+        "success": True,
+        "deduplicated": False,
+        "path": str(MEMBER_MD_PATH),
+        "message": f"已写入 member.md: {clean_title}",
+    }
+
+
+def gary_save_member_memory(
+    title: str,
+    experience: str,
+    tags: list = None,
+    importance: str = "high",
+) -> dict:
+    """将高价值经验写入 Gary 的 member.md 经验库。"""
+    return _append_member_memory(
+        title=title,
+        experience=experience,
+        tags=tags or [],
+        source="model",
+        importance=importance,
+    )
+
+
+def _infer_code_tags(code: str) -> list[str]:
+    text = code or ""
+    checks = [
+        ("rtos", any(token in text for token in ("FreeRTOS.h", "xTaskCreate", "vTaskDelay(", "task.h"))),
+        ("uart", "HAL_UART_" in text or "USART" in text),
+        ("debug_print", "Debug_Print(" in text or "Debug_PrintInt(" in text),
+        ("boot_marker", "Gary:BOOT" in text),
+        ("systick", "SysTick_Handler" in text),
+        ("i2c", "HAL_I2C_" in text or "I2C_HandleTypeDef" in text),
+        ("spi", "HAL_SPI_" in text or "SPI_HandleTypeDef" in text),
+        ("adc", "HAL_ADC_" in text or "ADC_HandleTypeDef" in text),
+        ("pwm", "HAL_TIM_PWM_" in text or "TIM_HandleTypeDef" in text),
+        ("oled", "OLED_" in text),
+        ("sensor_check", "HAL_I2C_IsDeviceReady" in text),
+        ("fault_analysis", "HardFault" in text or "SCB_CFSR" in text),
+    ]
+    tags = [name for name, matched in checks if matched]
+    if "rtos" not in tags:
+        tags.insert(0, "baremetal")
+    return tags[:10]
+
+
+def _derive_success_patterns_from_code(code: str) -> list[str]:
+    text = code or ""
+    patterns = []
+    if "Gary:BOOT" in text and ("MX_USART" in text or "HAL_UART_Init" in text):
+        patterns.append("UART 初始化后会尽早打印 Gary:BOOT，启动链路更容易确认。")
+    if "SysTick_Handler" in text and "FreeRTOS.h" not in text:
+        patterns.append("裸机代码显式定义 SysTick_Handler，HAL_Delay 不会卡死。")
+    if "vApplicationTickHook" in text:
+        patterns.append("FreeRTOS 项目通过 vApplicationTickHook 维持 HAL tick。")
+    if "HAL_I2C_IsDeviceReady" in text:
+        patterns.append("I2C 设备在使用前会先做在线探测。")
+    if "Debug_Print(" in text or "Debug_PrintInt(" in text:
+        patterns.append("代码保留了轻量串口调试输出，便于运行时定位问题。")
+    if "xTaskCreate" in text:
+        patterns.append("当前成功模板已经包含可编译的 FreeRTOS 任务结构。")
+    if "str_replace_edit" in text:
+        patterns.append("此模板来自增量修改链路，适合继续做精准替换。")
+    return patterns[:5]
+
+
+def _record_success_memory(
+    event_type: str,
+    code: str,
+    result: Optional[dict] = None,
+    request: str = "",
+    steps: Optional[list] = None,
+):
+    try:
+        tags = _infer_code_tags(code)
+        chip = _current_chip or DEFAULT_CHIP or "UNKNOWN"
+        mode = "rtos" if "rtos" in tags else "baremetal"
+        short_request = _normalize_member_text(request, limit=60)
+        if event_type == "runtime_success":
+            title = f"运行成功闭环 | {chip} | {mode}"
+            if short_request:
+                title += f" | {short_request}"
+        else:
+            title = f"编译成功模板 | {chip} | {mode}"
+
+        lines = []
+        if short_request:
+            lines.append(f"需求: {short_request}")
+        if result and result.get("bin_size"):
+            lines.append(f"bin_size: {result['bin_size']} B")
+        if tags:
+            lines.append(f"特征: {', '.join(tags[:8])}")
+        if event_type == "runtime_success":
+            lines.append("烧录、启动、串口/寄存器验证通过，无 HardFault、无硬件缺失。")
+            uart_step = next((step for step in (steps or []) if step.get("step") == "uart"), None)
+            reg_step = next((step for step in (steps or []) if step.get("step") == "registers"), None)
+            if uart_step and uart_step.get("boot_ok"):
+                lines.append("串口已看到 Gary:BOOT，启动链路正常。")
+            if reg_step and reg_step.get("key_regs"):
+                reg_names = list(reg_step["key_regs"].keys())[:6]
+                lines.append(f"运行时已回读关键寄存器: {', '.join(reg_names)}")
+        else:
+            lines.append("当前代码已在本机工具链上成功编译通过。")
+        lines.extend(_derive_success_patterns_from_code(code))
+        _append_member_memory(
+            title=title,
+            experience="\n".join(lines),
+            tags=tags,
+            source=event_type,
+            importance="critical" if event_type == "runtime_success" else "high",
+        )
+    except Exception as e:
+        _telegram_log(f"member auto_save error={str(e)[:160]}")
+
+
+def _member_prompt_section() -> str:
+    with _MEMBER_LOCK:
+        path = _ensure_member_file()
+        current = path.read_text(encoding="utf-8")
+    header, entries = _split_member_content(current)
+    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
+    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
+
+    selected = []
+    total = len(header)
+    for entry in pinned:
+        needed = len(entry) + 2
+        if selected and total + needed > MEMBER_PROMPT_CHAR_LIMIT:
+            break
+        selected.append(entry)
+        total += needed
+
+    recent = []
+    for entry in reversed(dynamic):
+        needed = len(entry) + 2
+        if recent and (total + needed > MEMBER_PROMPT_CHAR_LIMIT or len(recent) >= MEMBER_PROMPT_MAX_DYNAMIC):
+            break
+        recent.append(entry)
+        total += needed
+    recent.reverse()
+    selected.extend(recent)
+
+    excerpt = header.rstrip()
+    if selected:
+        excerpt += "\n\n" + "\n\n".join(selected)
+    return (
+        "## Gary Member Memory（重点）\n"
+        "以下内容来自 member.md，是 Gary 的长期经验库。优先复用这些成功经验；"
+        "遇到新的高价值经验时，调用 `gary_save_member_memory` 写进去。\n\n"
+        f"{excerpt.strip()}"
+    )
+
+
+def _member_preview_markdown(max_dynamic: int = 10) -> str:
+    with _MEMBER_LOCK:
+        path = _ensure_member_file()
+        current = path.read_text(encoding="utf-8")
+    header, entries = _split_member_content(current)
+    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
+    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
+    selected = pinned + dynamic[-max_dynamic:]
+    path_line = _cli_text("路径", "Path")
+    body = header.rstrip()
+    if selected:
+        body += "\n\n" + "\n\n".join(selected)
+    return f"**{path_line}:** `{path}`\n\n{body.strip()}"
+
+
+# ─────────────────────────────────────────────────────────────
+# Telegram 机器人配置 / 守护进程 / 长轮询
+# ─────────────────────────────────────────────────────────────
+GARY_HOME = Path.home() / ".gary"
+TELEGRAM_CONFIG_PATH = GARY_HOME / "telegram_bot.json"
+TELEGRAM_PID_PATH = GARY_HOME / "telegram_bot.pid"
+TELEGRAM_LOG_PATH = GARY_HOME / "telegram_bot.log"
+TELEGRAM_MESSAGE_LIMIT = 3800
+_TELEGRAM_CONFIG_LOCK = threading.RLock()
+
+
+def _ensure_gary_home():
+    GARY_HOME.mkdir(parents=True, exist_ok=True)
+
+
+def _default_telegram_config() -> dict:
+    return {
+        "bot_token": "",
+        "bot_id": None,
+        "bot_username": "",
+        "bot_name": "",
+        "allow_all_chats": False,
+        "allowed_chat_ids": [],
+        "allowed_user_ids": [],
+        "last_update_id": 0,
+        "updated_at": "",
+    }
+
+
+def _unique_int_list(values: Any) -> list[int]:
+    result = []
+    seen = set()
+    for value in values or []:
+        try:
+            num = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if num in seen:
+            continue
+        seen.add(num)
+        result.append(num)
+    return result
+
+
+def _normalize_telegram_config(config: Optional[dict]) -> dict:
+    merged = _default_telegram_config()
+    if isinstance(config, dict):
+        merged.update(config)
+    merged["allow_all_chats"] = bool(merged.get("allow_all_chats", False))
+    merged["allowed_chat_ids"] = _unique_int_list(merged.get("allowed_chat_ids"))
+    merged["allowed_user_ids"] = _unique_int_list(merged.get("allowed_user_ids"))
+    try:
+        merged["last_update_id"] = int(merged.get("last_update_id", 0) or 0)
+    except (TypeError, ValueError):
+        merged["last_update_id"] = 0
+    return merged
+
+
+def _read_telegram_config() -> dict:
+    with _TELEGRAM_CONFIG_LOCK:
+        if not TELEGRAM_CONFIG_PATH.exists():
+            return _default_telegram_config()
+        try:
+            raw = json.loads(TELEGRAM_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return _default_telegram_config()
+        return _normalize_telegram_config(raw)
+
+
+def _write_telegram_config(config: dict) -> dict:
+    with _TELEGRAM_CONFIG_LOCK:
+        _ensure_gary_home()
+        clean = _normalize_telegram_config(config)
+        clean["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        TELEGRAM_CONFIG_PATH.write_text(
+            json.dumps(clean, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return clean
+
+
+def _telegram_is_configured(config: Optional[dict] = None) -> bool:
+    config = config or _read_telegram_config()
+    token = str(config.get("bot_token", "")).strip()
+    placeholders = ("", "YOUR_TELEGRAM_BOT_TOKEN", "123456:ABC")
+    return bool(token and token not in placeholders and ":" in token)
+
+
+def _mask_telegram_token(token: str) -> str:
+    if not token:
+        return "(未设置)"
+    return token[:8] + "..." + token[-6:] if len(token) > 20 else "***"
+
+
+def _split_tokens(raw: str) -> list[str]:
+    return [tok for tok in re.split(r"[\s,]+", raw.strip()) if tok]
+
+
+def _parse_telegram_targets(raw: str) -> dict:
+    parsed = {"chat_ids": [], "user_ids": [], "invalid": []}
+    for token in _split_tokens(raw):
+        kind = "chat"
+        value = token
+        lower = token.lower()
+        if lower.startswith("user:"):
+            kind, value = "user", token.split(":", 1)[1]
+        elif lower.startswith("chat:"):
+            kind, value = "chat", token.split(":", 1)[1]
+        try:
+            num = int(value)
+        except ValueError:
+            parsed["invalid"].append(token)
+            continue
+        if kind == "user":
+            parsed["user_ids"].append(num)
+        else:
+            parsed["chat_ids"].append(num)
+    parsed["chat_ids"] = _unique_int_list(parsed["chat_ids"])
+    parsed["user_ids"] = _unique_int_list(parsed["user_ids"])
+    return parsed
+
+
+def _telegram_set_permissions(
+    *,
+    add_chat_ids: Optional[list[int]] = None,
+    remove_chat_ids: Optional[list[int]] = None,
+    add_user_ids: Optional[list[int]] = None,
+    remove_user_ids: Optional[list[int]] = None,
+    allow_all_chats: Optional[bool] = None,
+) -> dict:
+    config = _read_telegram_config()
+    chats = set(config.get("allowed_chat_ids", []))
+    users = set(config.get("allowed_user_ids", []))
+    chats.update(add_chat_ids or [])
+    users.update(add_user_ids or [])
+    chats.difference_update(remove_chat_ids or [])
+    users.difference_update(remove_user_ids or [])
+    config["allowed_chat_ids"] = sorted(chats)
+    config["allowed_user_ids"] = sorted(users)
+    if allow_all_chats is not None:
+        config["allow_all_chats"] = bool(allow_all_chats)
+    return _write_telegram_config(config)
+
+
+def _read_pid_file() -> Optional[int]:
+    try:
+        return int(TELEGRAM_PID_PATH.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _pid_is_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        try:
+            stat_text = proc_stat.read_text(encoding="utf-8", errors="ignore")
+            fields = stat_text.split()
+            if len(fields) >= 3 and fields[2] == "Z":
+                return False
+            return True
+        except Exception:
+            pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _write_pid_file(pid: int):
+    _ensure_gary_home()
+    TELEGRAM_PID_PATH.write_text(str(pid), encoding="utf-8")
+
+
+def _clear_pid_file(expected_pid: Optional[int] = None):
+    if not TELEGRAM_PID_PATH.exists():
+        return
+    if expected_pid is not None:
+        current = _read_pid_file()
+        if current and current != expected_pid:
+            return
+    try:
+        TELEGRAM_PID_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _telegram_daemon_status() -> dict:
+    pid = _read_pid_file()
+    running = _pid_is_alive(pid)
+    if pid and not running:
+        _clear_pid_file(pid)
+        pid = None
+    return {
+        "running": running,
+        "pid": pid,
+        "log_path": str(TELEGRAM_LOG_PATH),
+    }
+
+
+def _telegram_api_call(token: str, method: str, payload: Optional[dict] = None, timeout: float = 30.0):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        response = requests.post(url, json=payload or {}, timeout=timeout)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Telegram API 网络错误: {e}") from e
+
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise RuntimeError(f"Telegram API 返回非法 JSON: HTTP {response.status_code}") from e
+
+    if response.status_code >= 400 or not data.get("ok"):
+        detail = data.get("description") or response.text[:200] or f"HTTP {response.status_code}"
+        raise RuntimeError(f"Telegram API 调用失败: {detail}")
+    return data.get("result")
+
+
+def _telegram_get_me(token: str) -> dict:
+    result = _telegram_api_call(token, "getMe", timeout=15.0)
+    return result if isinstance(result, dict) else {}
+
+
+def _telegram_set_my_commands(token: str):
+    commands = [
+        {"command": "start", "description": "查看 Gary 机器人状态和用法"},
+        {"command": "help", "description": "查看 Telegram 侧命令"},
+        {"command": "clear", "description": "清空当前聊天上下文"},
+        {"command": "status", "description": "查看 Gary 当前硬件状态"},
+        {"command": "connect", "description": "连接探针和串口，可带芯片型号"},
+        {"command": "disconnect", "description": "断开当前硬件连接"},
+        {"command": "chip", "description": "查看或切换芯片型号"},
+        {"command": "projects", "description": "查看最近历史项目"},
+    ]
+    _telegram_api_call(token, "setMyCommands", {"commands": commands}, timeout=20.0)
+
+
+def _telegram_split_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    source = (text or "").strip() or "Gary 已处理，但没有返回文本。"
+    chunks = []
+    while len(source) > limit:
+        cut = source.rfind("\n\n", 0, limit)
+        if cut < limit // 3:
+            cut = source.rfind("\n", 0, limit)
+        if cut < limit // 3:
+            cut = source.rfind(" ", 0, limit)
+        if cut < limit // 3:
+            cut = limit
+        chunks.append(source[:cut].rstrip())
+        source = source[cut:].lstrip()
+    if source:
+        chunks.append(source)
+    return chunks
+
+
+def _telegram_send_text(token: str, chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
+    for index, chunk in enumerate(_telegram_split_text(text)):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "disable_web_page_preview": True,
+        }
+        if index == 0 and reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        _telegram_api_call(token, "sendMessage", payload, timeout=20.0)
+
+
+def _telegram_log(message: str):
+    try:
+        _ensure_gary_home()
+        with TELEGRAM_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+    except Exception:
+        pass
+
+
+def _telegram_send_chat_action(token: str, chat_id: int, action: str = "typing"):
+    _telegram_api_call(
+        token,
+        "sendChatAction",
+        {"chat_id": chat_id, "action": action},
+        timeout=10.0,
+    )
+
+
+class _TelegramTypingPulse:
+    def __init__(self, token: str, chat_id: int, interval: float = 4.0):
+        self.token = token
+        self.chat_id = chat_id
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"TelegramTypingPulse:{self.chat_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                _telegram_send_chat_action(self.token, self.chat_id, action="typing")
+            except Exception:
+                pass
+            if self._stop_event.wait(self.interval):
+                break
+
+
+class _TelegramPhaseReporter:
+    def __init__(
+        self,
+        token: str,
+        chat_id: int,
+        reply_to_message_id: Optional[int] = None,
+        idle_notice_delay: float = 60.0,
+        heartbeat_interval: float = 60.0,
+    ):
+        self.token = token
+        self.chat_id = chat_id
+        self.reply_to_message_id = reply_to_message_id
+        self.idle_notice_delay = idle_notice_delay
+        self.heartbeat_interval = heartbeat_interval
+        self.preface_text = ""
+        self.preface_sent = False
+        self._idle_notice_sent = False
+        self._last_tool_notice = ""
+        self._last_tool_notice_ts = 0.0
+        self._current_stage = "分析需求"
+        self._last_progress_ts = time.time()
+        self._stop_event = threading.Event()
+        self._progress_thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._progress_thread and self._progress_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._progress_thread = threading.Thread(
+            target=self._progress_loop,
+            name=f"TelegramProgress:{self.chat_id}",
+            daemon=True,
+        )
+        self._progress_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._progress_thread and self._progress_thread.is_alive():
+            self._progress_thread.join(timeout=0.5)
+        self._progress_thread = None
+
+    def capture_preface(self, text: str):
+        cleaned = (text or "").strip()
+        if cleaned:
+            self.preface_text = cleaned
+
+    def send_preface_if_needed(self):
+        if self.preface_sent or not self.preface_text:
+            return
+        try:
+            _telegram_send_text(
+                self.token,
+                self.chat_id,
+                self.preface_text,
+                reply_to_message_id=self.reply_to_message_id,
+            )
+            self.preface_sent = True
+            self._note_progress("前置说明")
+            _telegram_log(f"telegram preface chat={self.chat_id} len={len(self.preface_text)}")
+        except Exception:
+            pass
+
+    def tool_start(self, name: str):
+        self.send_preface_if_needed()
+        tool_name = (name or "").strip() or "unknown"
+        now = time.time()
+        if tool_name == self._last_tool_notice and now - self._last_tool_notice_ts < 1.5:
+            return
+        self._last_tool_notice = tool_name
+        self._last_tool_notice_ts = now
+        self._current_stage = f"执行工具 {tool_name}"
+        try:
+            _telegram_send_text(
+                self.token,
+                self.chat_id,
+                f"🔧 正在调用工具: {tool_name}",
+                reply_to_message_id=self.reply_to_message_id,
+            )
+            self._note_progress(self._current_stage)
+            _telegram_log(f"telegram tool_start chat={self.chat_id} name={tool_name}")
+        except Exception:
+            pass
+
+    def tool_finish(self, name: str, preview: str = ""):
+        tool_name = (name or "").strip() or "unknown"
+        self._current_stage = f"等待下一步 ({tool_name} 已完成)"
+        text = f"✅ 工具完成: {tool_name}"
+        snippet = (preview or "").strip()
+        if snippet:
+            snippet = snippet[:100]
+            text += f"\n{snippet}"
+        try:
+            _telegram_send_text(
+                self.token,
+                self.chat_id,
+                text,
+                reply_to_message_id=self.reply_to_message_id,
+            )
+            self._note_progress(self._current_stage)
+            _telegram_log(f"telegram tool_finish chat={self.chat_id} name={tool_name}")
+        except Exception:
+            pass
+
+    def tool_error(self, name: str, error: str):
+        self.send_preface_if_needed()
+        self._current_stage = f"工具失败 {(name or '').strip() or 'unknown'}"
+        try:
+            detail = (error or "").strip()
+            if len(detail) > 160:
+                detail = detail[:157] + "..."
+            _telegram_send_text(
+                self.token,
+                self.chat_id,
+                f"❌ 工具失败: {(name or '').strip() or 'unknown'}\n{detail or '未知错误'}",
+                reply_to_message_id=self.reply_to_message_id,
+            )
+            self._note_progress(self._current_stage)
+            _telegram_log(f"telegram tool_error chat={self.chat_id} name={(name or '').strip() or 'unknown'} detail={detail[:80]}")
+        except Exception:
+            pass
+
+    def strip_preface_from_reply(self, reply: str) -> str:
+        cleaned_reply = (reply or "").strip()
+        preface = self.preface_text.strip()
+        if not self.preface_sent or not preface or not cleaned_reply:
+            return cleaned_reply
+        if cleaned_reply == preface:
+            return ""
+        prefix = preface + "\n\n"
+        if cleaned_reply.startswith(prefix):
+            return cleaned_reply[len(prefix):].lstrip()
+        return cleaned_reply
+
+    def _note_progress(self, stage: str):
+        self._current_stage = stage
+        self._last_progress_ts = time.time()
+
+    def _progress_loop(self):
+        while not self._stop_event.wait(1.0):
+            now = time.time()
+            if (
+                not self._idle_notice_sent
+                and not self.preface_sent
+                and not self._last_tool_notice
+                and now - self._last_progress_ts >= self.idle_notice_delay
+            ):
+                try:
+                    _telegram_send_text(
+                        self.token,
+                        self.chat_id,
+                        "Gary 正在分析需求，准备开始处理。",
+                        reply_to_message_id=self.reply_to_message_id,
+                    )
+                    self._idle_notice_sent = True
+                    self._note_progress("分析需求")
+                    _telegram_log(f"telegram idle_notice chat={self.chat_id}")
+                except Exception:
+                    pass
+                continue
+
+            if now - self._last_progress_ts < self.heartbeat_interval:
+                continue
+
+            stage = self._current_stage or "处理中"
+            try:
+                _telegram_send_text(
+                    self.token,
+                    self.chat_id,
+                    f"⏳ Gary 仍在处理: {stage}",
+                    reply_to_message_id=self.reply_to_message_id,
+                )
+                self._note_progress(stage)
+                _telegram_log(f"telegram heartbeat chat={self.chat_id} stage={stage}")
+            except Exception:
+                pass
+
+
+def _telegram_is_authorized(config: dict, chat_id: int, user_id: int) -> bool:
+    if config.get("allow_all_chats"):
+        return True
+    if chat_id in set(config.get("allowed_chat_ids", [])):
+        return True
+    if user_id in set(config.get("allowed_user_ids", [])):
+        return True
+    return False
+
+
+def _telegram_unauthorized_text(chat_id: int, user_id: int) -> str:
+    return (
+        "这个 Telegram 会话还没授权。\n\n"
+        f"chat_id = {chat_id}\n"
+        f"user_id = {user_id}\n\n"
+        "请在终端执行任一命令后再试：\n"
+        f"gary telegram allow {chat_id}\n"
+        f"gary telegram allow user:{user_id}"
+    )
+
+
+def _telegram_status_lines(include_commands: bool = True) -> list[str]:
+    config = _read_telegram_config()
+    daemon = _telegram_daemon_status()
+    lines = [
+        "Telegram 机器人状态",
+        f"AI 接口: {'已配置' if _ai_is_configured() else '未配置'}",
+        f"机器人: {'已配置' if _telegram_is_configured(config) else '未配置'}",
+        f"Token: {_mask_telegram_token(config.get('bot_token', ''))}",
+        f"Bot: @{config.get('bot_username') or '-'}",
+        f"Bot 名称: {config.get('bot_name') or '-'}",
+        f"授权模式: {'允许所有 chat' if config.get('allow_all_chats') else '白名单'}",
+        f"允许的 chat_id: {config.get('allowed_chat_ids') or '[]'}",
+        f"允许的 user_id: {config.get('allowed_user_ids') or '[]'}",
+        f"守护进程: {'运行中' if daemon['running'] else '未运行'}",
+        f"PID: {daemon.get('pid') or '-'}",
+        f"日志: {daemon['log_path']}",
+        f"last_update_id: {config.get('last_update_id', 0)}",
+    ]
+    if include_commands:
+        lines.extend([
+            "",
+            "常用命令:",
+            "gary telegram start        启动后台机器人",
+            "gary telegram stop         停止后台机器人",
+            "gary telegram allow <id>   添加 chat_id 白名单",
+            "gary telegram allow user:<id>   添加 user_id 白名单",
+            "gary telegram remove <id>  删除白名单",
+            "gary telegram allow-all    允许所有 chat",
+            "gary telegram whitelist    切回白名单模式",
+            "gary telegram reset        删除 Telegram 配置并停止机器人",
+        ])
+    return lines
+
+
+def _print_telegram_status(include_commands: bool = True):
+    CONSOLE.print("\n".join(_telegram_status_lines(include_commands=include_commands)))
+    CONSOLE.print()
+
+
+def _telegram_help_text() -> str:
+    return "\n".join([
+        "Telegram 侧可用命令：",
+        "/start  查看状态和授权信息",
+        "/help   查看帮助",
+        "/clear  清空当前聊天上下文",
+        "/status 查看 Gary 当前硬件状态",
+        "/connect [芯片] 连接探针和串口",
+        "/disconnect 断开硬件",
+        "/chip [型号] 查看或切换芯片",
+        "/projects 查看最近历史项目",
+        "",
+        "其他普通文本会直接发给 Gary，保持当前聊天上下文连续对话。",
+    ])
+
+
+def _format_hw_status_for_text(status: dict) -> str:
+    return "\n".join([
+        "Gary 当前状态",
+        f"chip: {status.get('chip', '-')}",
+        f"hw_connected: {status.get('hw_connected', False)}",
+        f"serial_connected: {status.get('serial_connected', False)}",
+        f"gcc_ok: {status.get('gcc_ok', False)}",
+        f"gcc_version: {status.get('gcc_version', '-')}",
+        f"hal_ok: {status.get('hal_ok', False)}",
+        f"hal_lib_ok: {status.get('hal_lib_ok', False)}",
+        f"workspace: {status.get('workspace', '-')}",
+    ])
+
+
+def _format_projects_for_text(projects: list[dict]) -> str:
+    if not projects:
+        return "暂无历史项目"
+    lines = ["最近项目："]
+    for item in projects[:10]:
+        lines.append(
+            f"- {item.get('name', '-')}"
+            f" | {item.get('chip', '-')}"
+            f" | {str(item.get('request', ''))[:40]}"
+        )
+    return "\n".join(lines)
+
+
+def _normalize_telegram_incoming_text(text: str, bot_username: str) -> Optional[str]:
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return stripped
+    head, sep, tail = stripped.partition(" ")
+    command = head
+    if "@" in head:
+        base, mention = head.split("@", 1)
+        if bot_username and mention.lower() != bot_username.lower():
+            return None
+        command = base
+    return f"{command}{sep}{tail}".strip()
+
+
+def configure_telegram_cli() -> dict:
+    CONSOLE.print()
+    CONSOLE.rule("[bold cyan]  配置 Telegram 机器人[/]")
+    CONSOLE.print()
+
+    config = _read_telegram_config()
+    if _telegram_is_configured(config):
+        CONSOLE.print(f"  [dim]当前 Token:[/] {_mask_telegram_token(config.get('bot_token', ''))}")
+        CONSOLE.print(f"  [dim]当前 Bot  :[/] @{config.get('bot_username') or '-'}")
+        CONSOLE.print(f"  [dim]授权模式 :[/] {'允许所有 chat' if config.get('allow_all_chats') else '白名单'}")
+        CONSOLE.print(f"  [dim]chat_id   :[/] {config.get('allowed_chat_ids') or '[]'}")
+        CONSOLE.print(f"  [dim]user_id   :[/] {config.get('allowed_user_ids') or '[]'}")
+        CONSOLE.print()
+
+    token = ""
+    current_token = str(config.get("bot_token", "")).strip()
+    while True:
+        try:
+            prompt = "  Bot Token"
+            if current_token:
+                prompt += "（回车保留当前）"
+            prompt += ": "
+            entered = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            CONSOLE.print("\n[dim]已取消[/]")
+            return {"success": False, "message": "已取消"}
+
+        token = entered or current_token
+        if not token:
+            CONSOLE.print("[yellow]  Bot Token 不能为空[/]")
+            continue
+        try:
+            me = _telegram_get_me(token)
+            config["bot_token"] = token
+            config["bot_id"] = me.get("id")
+            config["bot_username"] = me.get("username", "")
+            config["bot_name"] = me.get("first_name", "")
+            CONSOLE.print(f"[green]  ✓ Token 有效，机器人: @{config['bot_username']}[/]")
+            break
+        except Exception as e:
+            CONSOLE.print(f"[red]  ✗ Token 校验失败: {e}[/]")
+
+    CONSOLE.print()
+    CONSOLE.print("[bold cyan]  授权模式[/]")
+    CONSOLE.print("    [yellow]1[/]. 白名单（推荐）")
+    CONSOLE.print("    [yellow]2[/]. 允许所有 chat")
+    CONSOLE.print()
+
+    default_choice = "2" if config.get("allow_all_chats") else "1"
+    try:
+        choice = input(f"  输入序号 [1-2]（默认 {default_choice}）: ").strip() or default_choice
+    except (EOFError, KeyboardInterrupt):
+        choice = default_choice
+
+    config["allow_all_chats"] = (choice == "2")
+
+    if not config["allow_all_chats"]:
+        try:
+            raw_targets = input(
+                "  输入白名单（chat_id 或 user:123，多项用空格/逗号分隔，回车保留当前）: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            raw_targets = ""
+        if raw_targets:
+            parsed = _parse_telegram_targets(raw_targets)
+            if parsed["invalid"]:
+                CONSOLE.print(f"[yellow]  忽略非法项: {parsed['invalid']}[/]")
+            config["allowed_chat_ids"] = parsed["chat_ids"]
+            config["allowed_user_ids"] = parsed["user_ids"]
+
+    saved = _write_telegram_config(config)
+    try:
+        _telegram_set_my_commands(saved["bot_token"])
+    except Exception as e:
+        CONSOLE.print(f"[yellow]  命令菜单注册失败，可忽略: {e}[/]")
+
+    CONSOLE.print()
+    CONSOLE.print("[green]  ✓ Telegram 配置已保存[/]")
+    CONSOLE.print(f"  [green]✓[/] Bot       @{saved.get('bot_username') or '-'}")
+    CONSOLE.print(f"  [green]✓[/] Token     {_mask_telegram_token(saved.get('bot_token', ''))}")
+    CONSOLE.print(
+        f"  [green]✓[/] 授权模式  {'允许所有 chat' if saved.get('allow_all_chats') else '白名单'}"
+    )
+    if not saved.get("allow_all_chats"):
+        CONSOLE.print(f"  [green]✓[/] chat_id   {saved.get('allowed_chat_ids') or '[]'}")
+        CONSOLE.print(f"  [green]✓[/] user_id   {saved.get('allowed_user_ids') or '[]'}")
+        CONSOLE.print("  [dim]若还不知道 chat_id，可先在 Telegram 给机器人发 /start，再按提示执行 allow 命令[/]")
+    CONSOLE.print()
+    return {"success": True, "config": saved}
+
+
+def _ensure_ai_for_telegram() -> bool:
+    if _ai_is_configured():
+        return True
+    CONSOLE.print("[yellow]Telegram 机器人要能回复，需要先配置 AI 接口[/]")
+    configure_ai_cli()
+    if _ai_is_configured():
+        return True
+    CONSOLE.print("[red]AI 接口仍未配置，无法启动 Telegram 机器人[/]")
+    return False
+
+
+def _start_telegram_daemon() -> dict:
+    daemon = _telegram_daemon_status()
+    if daemon["running"]:
+        return {"success": True, "message": f"Telegram 机器人已在后台运行（PID {daemon['pid']}）"}
+
+    config = _read_telegram_config()
+    if not _telegram_is_configured(config):
+        return {"success": False, "message": "Telegram 机器人尚未配置，请先运行 gary telegram 或 /telegram"}
+    if not _ai_is_configured():
+        return {"success": False, "message": "AI 接口未配置，先运行 gary config 或 /config"}
+
+    _ensure_gary_home()
+    log_handle = TELEGRAM_LOG_PATH.open("a", encoding="utf-8")
+    log_handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] starting telegram daemon\n")
+    log_handle.flush()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(_HERE / "stm32_agent.py"), "telegram", "serve", "--daemonized"],
+            cwd=str(_HERE),
+            stdout=log_handle,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+
+    time.sleep(1.2)
+    if _pid_is_alive(process.pid):
+        return {"success": True, "message": f"Telegram 机器人已启动（PID {process.pid}）", "pid": process.pid}
+    return {"success": False, "message": f"后台启动失败，请查看日志: {TELEGRAM_LOG_PATH}"}
+
+
+def _stop_telegram_daemon() -> dict:
+    daemon = _telegram_daemon_status()
+    pid = daemon.get("pid")
+    if not daemon["running"] or not pid:
+        return {"success": True, "message": "Telegram 机器人当前未运行"}
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        _clear_pid_file(pid)
+        return {"success": False, "message": f"停止失败: {e}"}
+
+    for _ in range(20):
+        if not _pid_is_alive(pid):
+            _clear_pid_file(pid)
+            return {"success": True, "message": f"Telegram 机器人已停止（PID {pid}）"}
+        time.sleep(0.2)
+
+    return {"success": False, "message": f"停止超时，请手动检查 PID {pid}"}
+
+
+def _reset_telegram_config() -> dict:
+    _stop_telegram_daemon()
+    if TELEGRAM_CONFIG_PATH.exists():
+        TELEGRAM_CONFIG_PATH.unlink()
+    return {"success": True, "message": f"已删除 Telegram 配置: {TELEGRAM_CONFIG_PATH}"}
+
+
+class TelegramBotBridge:
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._chat_agents: Dict[int, "STM32Agent"] = {}
+        self._last_error = ""
+        self._started_at: Optional[float] = None
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self) -> dict:
+        config = _read_telegram_config()
+        if not _telegram_is_configured(config):
+            return {"success": False, "message": "Telegram 机器人未配置"}
+        if not _ai_is_configured():
+            return {"success": False, "message": "AI 接口未配置"}
+        if self.is_running():
+            return {"success": True, "message": "Telegram 机器人已在当前进程运行"}
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, name="GaryTelegramBridge", daemon=True)
+        self._thread.start()
+        self._started_at = time.time()
+        return {"success": True, "message": "Telegram 机器人已启动"}
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+
+    def status(self) -> dict:
+        return {
+            "running": self.is_running(),
+            "started_at": self._started_at,
+            "last_error": self._last_error,
+            "chat_sessions": len(self._chat_agents),
+        }
+
+    def _get_agent(self, chat_id: int) -> "STM32Agent":
+        agent = self._chat_agents.get(chat_id)
+        if agent is None:
+            agent = STM32Agent(interactive=False)
+            self._chat_agents[chat_id] = agent
+        agent.refresh_ai_client()
+        return agent
+
+    def _reset_chat(self, chat_id: int):
+        self._chat_agents.pop(chat_id, None)
+
+    def _poll_loop(self):
+        while not self._stop_event.is_set():
+            config = _read_telegram_config()
+            token = str(config.get("bot_token", "")).strip()
+            if not token:
+                self._last_error = "Telegram Token 为空"
+                time.sleep(2.0)
+                continue
+
+            latest_seen = int(config.get("last_update_id", 0))
+            try:
+                updates = _telegram_api_call(
+                    token,
+                    "getUpdates",
+                    {
+                        "offset": latest_seen + 1,
+                        "timeout": 25,
+                        "allowed_updates": ["message"],
+                    },
+                    timeout=35.0,
+                ) or []
+                self._last_error = ""
+            except Exception as e:
+                self._last_error = str(e)
+                time.sleep(2.0)
+                continue
+
+            for update in updates:
+                latest_seen = max(latest_seen, int(update.get("update_id", 0)))
+                try:
+                    self._handle_update(update)
+                except Exception as e:
+                    self._last_error = str(e)
+                    CONSOLE.print(f"[red]Telegram 处理失败: {e}[/]")
+
+            if latest_seen > int(config.get("last_update_id", 0)):
+                config["last_update_id"] = latest_seen
+                _write_telegram_config(config)
+
+    def _handle_update(self, update: dict):
+        message = update.get("message")
+        if not message:
+            return
+
+        chat = message.get("chat") or {}
+        from_user = message.get("from") or {}
+        text = message.get("text", "")
+        if not text:
+            return
+
+        config = _read_telegram_config()
+        token = config["bot_token"]
+        chat_id = int(chat.get("id"))
+        user_id = int(from_user.get("id", 0))
+        message_id = message.get("message_id")
+        normalized = _normalize_telegram_incoming_text(text, str(config.get("bot_username", "")))
+        if normalized is None:
+            return
+        update_id = int(update.get("update_id", 0))
+        preview = normalized.replace("\n", " ").strip()[:80]
+        _telegram_log(f"telegram update={update_id} chat={chat_id} user={user_id} text={preview!r}")
+
+        reply = None
+        if normalized.startswith("/"):
+            if _telegram_is_authorized(config, chat_id, user_id):
+                with _TelegramTypingPulse(token, chat_id):
+                    handled, reply = self._handle_command(normalized, config, chat_id, user_id)
+                    if handled:
+                        if reply:
+                            _telegram_send_text(token, chat_id, reply, reply_to_message_id=message_id)
+                        return
+            else:
+                handled, reply = self._handle_command(normalized, config, chat_id, user_id)
+                if handled:
+                    if reply:
+                        _telegram_send_text(token, chat_id, reply, reply_to_message_id=message_id)
+                    return
+
+        if not _telegram_is_authorized(config, chat_id, user_id):
+            _telegram_log(f"telegram unauthorized chat={chat_id} user={user_id}")
+            _telegram_send_text(token, chat_id, _telegram_unauthorized_text(chat_id, user_id), reply_to_message_id=message_id)
+            return
+
+        agent = self._get_agent(chat_id)
+        reporter = _TelegramPhaseReporter(token, chat_id, reply_to_message_id=message_id)
+
+        def _on_text(preview_text: str):
+            reporter.capture_preface(preview_text)
+
+        def _on_tool(event: dict):
+            phase = event.get("phase")
+            name = event.get("name", "")
+            if phase == "start":
+                reporter.tool_start(name)
+            elif phase == "finish":
+                reporter.tool_finish(name, event.get("preview", ""))
+            elif phase == "error":
+                reporter.tool_error(name, event.get("error", ""))
+
+        with _TelegramTypingPulse(token, chat_id):
+            reporter.start()
+            started_at = time.time()
+            try:
+                reply = agent.chat(
+                    normalized,
+                    stream_to_console=False,
+                    text_callback=_on_text,
+                    tool_callback=_on_tool,
+                ).strip()
+            finally:
+                reporter.stop()
+            reply = reporter.strip_preface_from_reply(reply)
+            if not reply:
+                _telegram_log(
+                    f"telegram empty_final chat={chat_id} preface_sent={reporter.preface_sent} preface_len={len(reporter.preface_text)}"
+                )
+                reply = "工具已执行，但 AI 没有返回最终正文。请重试一次；若仍复现，我会继续排查。"
+            _telegram_send_text(token, chat_id, reply, reply_to_message_id=message_id)
+            _telegram_log(f"telegram reply chat={chat_id} elapsed={time.time() - started_at:.1f}s len={len(reply)}")
+
+    def _handle_command(self, command_text: str, config: dict, chat_id: int, user_id: int) -> tuple[bool, str]:
+        parts = command_text.split(None, 1)
+        head = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        authorized = _telegram_is_authorized(config, chat_id, user_id)
+
+        if head in ("/start", "/help"):
+            if authorized:
+                return True, _telegram_help_text()
+            return True, _telegram_unauthorized_text(chat_id, user_id) + "\n\n发送授权后再试。"
+
+        if not authorized:
+            return True, _telegram_unauthorized_text(chat_id, user_id)
+
+        if head in ("/clear", "/new"):
+            self._reset_chat(chat_id)
+            return True, "当前 Telegram 会话上下文已清空。"
+
+        if head == "/status":
+            return True, _format_hw_status_for_text(stm32_hardware_status())
+
+        if head == "/connect":
+            result = stm32_connect(arg or None)
+            return True, result.get("message", json.dumps(result, ensure_ascii=False))
+
+        if head == "/disconnect":
+            result = stm32_disconnect()
+            return True, result.get("message", json.dumps(result, ensure_ascii=False))
+
+        if head == "/chip":
+            if not arg:
+                return True, f"当前芯片: {_current_chip or '(未设置)'}"
+            result = stm32_set_chip(arg)
+            return True, f"已切换芯片: {result.get('chip')} ({result.get('family')})"
+
+        if head == "/projects":
+            result = stm32_list_projects()
+            return True, _format_projects_for_text(result.get("projects", []))
+
+        if head == "/serial":
+            tokens = arg.split()
+            if tokens and tokens[0] == "list":
+                ports = detect_serial_ports()
+                return True, "可用串口: " + (", ".join(ports) if ports else "无")
+            port = tokens[0] if tokens and tokens[0].startswith("/dev/") else None
+            baud = None
+            for token in tokens:
+                if token.isdigit():
+                    baud = int(token)
+                    break
+            result = stm32_serial_connect(port, baud)
+            return True, result.get("message", json.dumps(result, ensure_ascii=False))
+
+        if head == "/telegram":
+            return True, "\n".join(_telegram_status_lines(include_commands=False))
+
+        return False, ""
+
+
+_telegram_bridge = TelegramBotBridge()
+_telegram_cli_autostart_done = False
+
+
+def _ensure_cli_telegram_daemon() -> Optional[dict]:
+    global _telegram_cli_autostart_done
+    if _telegram_cli_autostart_done:
+        return None
+    _telegram_cli_autostart_done = True
+
+    configured = _telegram_is_configured()
+    ai_ready = _ai_is_configured()
+    if not configured and not ai_ready:
+        return None
+    if configured and not ai_ready:
+        return {
+            "success": False,
+            "message": _cli_text(
+                "已检测到 Telegram 配置，但 AI 接口未配置，未自动启动",
+                "Telegram is configured, but AI is not configured, so it was not started automatically",
+            ),
+        }
+    if not configured:
+        return None
+
+    daemon = _telegram_daemon_status()
+    if daemon["running"]:
+        return {
+            "success": True,
+            "message": f"{_cli_text('已在后台运行', 'already running in background')} (PID {daemon.get('pid')})",
+        }
+
+    result = _start_telegram_daemon()
+    return {
+        "success": bool(result.get("success")),
+        "message": str(result.get("message", "")).strip(),
+    }
+
+
+def serve_telegram_forever(daemonized: bool = False) -> int:
+    if not _telegram_is_configured():
+        CONSOLE.print("[red]Telegram 机器人未配置[/]")
+        return 1
+    if not _ai_is_configured():
+        CONSOLE.print("[red]AI 接口未配置，无法启动 Telegram 机器人[/]")
+        return 1
+
+    result = _telegram_bridge.start()
+    if not result["success"]:
+        CONSOLE.print(f"[red]{result['message']}[/]")
+        return 1
+
+    if daemonized:
+        _write_pid_file(os.getpid())
+        atexit.register(lambda: _clear_pid_file(os.getpid()))
+
+    CONSOLE.print("[green]Telegram 机器人正在运行，Ctrl+C 停止[/]")
+    try:
+        while _telegram_bridge.is_running():
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        CONSOLE.print("\n[yellow]收到停止信号，正在退出 Telegram 机器人...[/]")
+    finally:
+        _telegram_bridge.stop()
+        if daemonized:
+            _clear_pid_file(os.getpid())
+    return 0
+
+
+def _interactive_telegram_menu() -> bool:
+    CONSOLE.print()
+    CONSOLE.rule("[bold cyan]  Telegram 管理[/]")
+    CONSOLE.print()
+    _print_telegram_status(include_commands=False)
+    CONSOLE.print("[bold cyan]  可执行操作：[/]")
+    CONSOLE.print("    [yellow]1[/]. 查看状态")
+    CONSOLE.print("    [yellow]2[/]. 重新配置机器人")
+    CONSOLE.print("    [yellow]3[/]. 启动后台机器人")
+    CONSOLE.print("    [yellow]4[/]. 停止后台机器人")
+    CONSOLE.print("    [yellow]5[/]. 添加白名单")
+    CONSOLE.print("    [yellow]6[/]. 删除白名单")
+    CONSOLE.print("    [yellow]7[/]. 允许所有 chat")
+    CONSOLE.print("    [yellow]8[/]. 切回白名单模式")
+    CONSOLE.print("    [yellow]9[/]. 重置 Telegram 配置")
+    CONSOLE.print()
+
+    try:
+        choice = input("  输入序号（回车取消）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        CONSOLE.print("\n[dim]已取消[/]\n")
+        return True
+
+    if not choice:
+        CONSOLE.print("[dim]已取消[/]\n")
+        return True
+
+    if choice == "1":
+        _print_telegram_status(include_commands=True)
+        return True
+
+    if choice == "2":
+        if not _ensure_ai_for_telegram():
+            return True
+        result = configure_telegram_cli()
+        if result.get("success"):
+            daemon = _telegram_daemon_status()
+            if daemon["running"]:
+                stop_result = _stop_telegram_daemon()
+                start_result = _start_telegram_daemon()
+                CONSOLE.print(f"[{'green' if stop_result['success'] else 'red'}]{stop_result['message']}[/]")
+                CONSOLE.print(f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]")
+                CONSOLE.print()
+        return True
+
+    if choice == "3":
+        return handle_telegram_command("start", source="builtin")
+
+    if choice == "4":
+        return handle_telegram_command("stop", source="builtin")
+
+    if choice in ("5", "6"):
+        action = "allow" if choice == "5" else "remove"
+        label = "添加" if choice == "5" else "删除"
+        try:
+            raw = input(f"  输入要{label}的 chat_id 或 user:123（可多个，空格分隔）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            CONSOLE.print("\n[dim]已取消[/]\n")
+            return True
+        if not raw:
+            CONSOLE.print("[dim]已取消[/]\n")
+            return True
+        return handle_telegram_command(f"{action} {raw}", source="builtin")
+
+    if choice == "7":
+        return handle_telegram_command("allow-all", source="builtin")
+
+    if choice == "8":
+        return handle_telegram_command("whitelist", source="builtin")
+
+    if choice == "9":
+        try:
+            confirm = input("  确认重置并删除 Telegram 配置？输入 yes 确认: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            CONSOLE.print("\n[dim]已取消[/]\n")
+            return True
+        if confirm != "yes":
+            CONSOLE.print("[dim]已取消[/]\n")
+            return True
+        return handle_telegram_command("reset", source="builtin")
+
+    CONSOLE.print(f"[yellow]未知选项: {choice}[/]\n")
+    return True
+
+
+def handle_telegram_command(args: str, source: str = "cli") -> bool:
+    arg = (args or "").strip()
+    config = _read_telegram_config()
+    parts = arg.split(None, 1)
+    subcmd = parts[0].lower() if parts and parts[0] else ""
+    subarg = parts[1].strip() if len(parts) > 1 else ""
+
+    if subcmd == "":
+        if source == "builtin":
+            return _interactive_telegram_menu()
+        if not _telegram_is_configured(config):
+            CONSOLE.print("[yellow]Telegram 机器人尚未配置，进入配置向导[/]")
+            if not _ensure_ai_for_telegram():
+                return True
+            result = configure_telegram_cli()
+            if not result.get("success"):
+                return True
+            start_result = _start_telegram_daemon()
+            CONSOLE.print(f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]")
+            CONSOLE.print()
+            return True
+        _print_telegram_status(include_commands=True)
+        return True
+
+    if subcmd in ("status", "info", "list", "ls"):
+        _print_telegram_status(include_commands=True)
+        return True
+
+    if subcmd in ("config", "setup"):
+        if not _ensure_ai_for_telegram():
+            return True
+        configure_telegram_cli()
+        return True
+
+    if subcmd in ("start", "run"):
+        if not _telegram_is_configured(config):
+            CONSOLE.print("[yellow]Telegram 机器人尚未配置，进入配置向导[/]")
+            if not _ensure_ai_for_telegram():
+                return True
+            result = configure_telegram_cli()
+            if not result.get("success"):
+                return True
+        elif not _ensure_ai_for_telegram():
+            return True
+        result = _start_telegram_daemon()
+        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
+        CONSOLE.print()
+        return True
+
+    if subcmd == "serve":
+        daemonized = "--daemonized" in _split_tokens(subarg)
+        sys.exit(serve_telegram_forever(daemonized=daemonized))
+
+    if subcmd == "stop":
+        result = _stop_telegram_daemon()
+        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
+        CONSOLE.print()
+        return True
+
+    if subcmd == "restart":
+        stop_result = _stop_telegram_daemon()
+        start_result = _start_telegram_daemon()
+        CONSOLE.print(f"[{'green' if stop_result['success'] else 'red'}]{stop_result['message']}[/]")
+        CONSOLE.print(f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]")
+        CONSOLE.print()
+        return True
+
+    if subcmd in ("allow", "add"):
+        if not subarg:
+            CONSOLE.print("[yellow]用法: gary telegram allow <chat_id|user:123> [...][/]\n")
+            return True
+        parsed = _parse_telegram_targets(subarg)
+        if parsed["invalid"]:
+            CONSOLE.print(f"[yellow]忽略非法项: {parsed['invalid']}[/]")
+        saved = _telegram_set_permissions(
+            add_chat_ids=parsed["chat_ids"],
+            add_user_ids=parsed["user_ids"],
+        )
+        CONSOLE.print("[green]Telegram 白名单已更新[/]")
+        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
+        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
+        return True
+
+    if subcmd in ("remove", "delete", "del", "rm"):
+        if not subarg:
+            CONSOLE.print("[yellow]用法: gary telegram remove <chat_id|user:123> [...][/]\n")
+            return True
+        parsed = _parse_telegram_targets(subarg)
+        if parsed["invalid"]:
+            CONSOLE.print(f"[yellow]忽略非法项: {parsed['invalid']}[/]")
+        saved = _telegram_set_permissions(
+            remove_chat_ids=parsed["chat_ids"],
+            remove_user_ids=parsed["user_ids"],
+        )
+        CONSOLE.print("[green]Telegram 白名单已更新[/]")
+        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
+        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
+        return True
+
+    if subcmd == "allow-all":
+        saved = _telegram_set_permissions(allow_all_chats=True)
+        CONSOLE.print("[green]已切换为允许所有 chat[/]")
+        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
+        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
+        return True
+
+    if subcmd == "whitelist":
+        saved = _telegram_set_permissions(allow_all_chats=False)
+        CONSOLE.print("[green]已切换为白名单模式[/]")
+        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
+        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
+        return True
+
+    if subcmd == "reset":
+        result = _reset_telegram_config()
+        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
+        CONSOLE.print()
+        return True
+
+    CONSOLE.print(f"[yellow]未知 Telegram 命令: {subcmd}[/]")
+    _print_telegram_status(include_commands=True)
+    return True
+
+
+def _shutdown_cli_runtime(stop_telegram: bool = True) -> dict:
+    """退出 CLI 时统一清理资源。"""
+    results = {
+        "hardware": stm32_disconnect(),
+        "bridge_stopped": False,
+        "telegram": {"success": True, "message": "Telegram 保持运行"},
+    }
+    try:
+        _telegram_bridge.stop()
+        results["bridge_stopped"] = True
+    except Exception as e:
+        results["bridge_stopped"] = False
+        results["bridge_error"] = str(e)
+    if stop_telegram:
+        try:
+            results["telegram"] = _stop_telegram_daemon()
+        except Exception as e:
+            results["telegram"] = {"success": False, "message": f"停止 Telegram 机器人失败: {e}"}
+    return results
+
 
 # ─────────────────────────────────────────────────────────────
 # UI 常量
@@ -1149,12 +2898,15 @@ def stm32_compile(code: str, chip: str = None) -> dict:
             (latest / "main.c").write_text(code, encoding="utf-8")
         except Exception as e:
             CONSOLE.print(f"[dim]  ⚠ 缓存保存失败: {e}[/]")
-    return {
+    payload = {
         "success": result["ok"],
         "message": (result.get("msg") or "")[:600],
         "bin_path": result.get("bin_path"),
         "bin_size": result.get("bin_size", 0),
     }
+    if payload["success"]:
+        _record_success_memory("compile_success", code=code, result=payload)
+    return payload
 
 
 def stm32_compile_rtos(code: str, chip: str = None) -> dict:
@@ -1173,12 +2925,15 @@ def stm32_compile_rtos(code: str, chip: str = None) -> dict:
             (latest / "main.c").write_text(code, encoding="utf-8")
         except Exception as e:
             CONSOLE.print(f"[dim]  ⚠ 缓存保存失败: {e}[/]")
-    return {
+    payload = {
         "success": result["ok"],
         "message": (result.get("msg") or "")[:600],
         "bin_path": result.get("bin_path"),
         "bin_size": result.get("bin_size", 0),
     }
+    if payload["success"]:
+        _record_success_memory("compile_success", code=code, result=payload)
+    return payload
 
 
 def stm32_recompile(mode: str = "auto") -> dict:
@@ -2152,6 +3907,13 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
         if runtime_ok:
             if request:
                 _stm32_save_project(code, comp, request)
+            _record_success_memory(
+                "runtime_success",
+                code=code,
+                result=comp,
+                request=request,
+                steps=steps,
+            )
             return {
                 "success": True, "attempt": attempt,
                 "steps": steps, "bin_size": comp.get("bin_size", 0),
@@ -2845,6 +4607,7 @@ TOOLS_MAP: Dict[str, Any] = {
     "stm32_save_code":        stm32_save_code,
     "stm32_list_projects":    stm32_list_projects,
     "stm32_read_project":     stm32_read_project,
+    "gary_save_member_memory": gary_save_member_memory,
     # 通用
     "read_file":              read_file,
     "create_or_overwrite_file": create_or_overwrite_file,
@@ -3271,6 +5034,35 @@ TOOL_SCHEMAS = [
                     "project_name": {"type": "string", "description": "项目目录名（从 stm32_list_projects 获取）"},
                 },
                 "required": ["project_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gary_save_member_memory",
+            "description": (
+                "把高价值、可复用的经验写入 member.md。"
+                "适用于：成功模板、关键初始化顺序、硬件易错点、寄存器判定经验、RTOS/裸机专项坑。"
+                "禁止写冗长日志，必须提炼成短而可执行的结论。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "经验标题，简短具体，如“F103 裸机 UART 先打 Gary:BOOT 再启 I2C”"},
+                    "experience": {"type": "string", "description": "经验正文，2-6 行为宜，写成可复用的做法/结论"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选标签，如 [\"baremetal\", \"uart\", \"i2c\", \"boot_marker\"]",
+                    },
+                    "importance": {
+                        "type": "string",
+                        "enum": ["medium", "high", "critical"],
+                        "description": "经验重要度，默认 high。",
+                    },
+                },
+                "required": ["title", "experience"],
             },
         },
     },
@@ -3702,7 +5494,7 @@ _skill_mgr = init_skills(TOOLS_MAP, TOOL_SCHEMAS)
 
 # ─────────────────────────────────────────────────────────────
 # STM32 系统提示词
-STM32_SYSTEM_PROMPT = """你是 Gary Dev Agent，专为 STM32 嵌入式开发设计的 AI 助手，深度集成了编译、烧录、调试工具链。
+STM32_BASE_SYSTEM_PROMPT = """你是 Gary Dev Agent，专为 STM32 嵌入式开发设计的 AI 助手，深度集成了编译、烧录、调试工具链。
 
 ## 核心能力
 1. **代码生成**：根据自然语言需求生成完整可编译的 STM32 HAL C 代码
@@ -3927,6 +5719,13 @@ int main(void) {
 - ADC 噪声大 → stm32_signal_capture 分析信号质量
 - Flash 快满了 → stm32_memory_map 查看占用
 
+## member.md 记忆机制（重点）
+- `member.md` 是 Gary 的长期经验库，会随系统提示词一起发送。
+- 成功编译、成功运行闭环会自动写入 `member.md`。
+- 遇到高价值、可复用、以后大概率还能帮上忙的经验时，**必须**调用 `gary_save_member_memory` 记下来。
+- 优先记录：稳定初始化顺序、成功模板、硬件易错点、寄存器判定经验、RTOS/裸机专项坑。
+- 记录必须短、具体、可执行，禁止把整段原始日志直接塞进去。
+
 ## 回复规范
 - **极度简洁**，像命令行工具一样输出，不写大段说明
 - 工具调用后只说结论，**禁止**逐条解释代码逻辑、列"代码说明"章节
@@ -3934,14 +5733,14 @@ int main(void) {
 - 编译/烧录失败：直接说错误原因 + 修复动作，不加前缀废话
 - 遇到错误直接修复，不询问"是否需要帮你修改"
 - 代码用 ```c 包裹，但**不在代码后加解释**，除非用户主动问
-- 中文回复，寄存器名/函数名保持英文
+- 回复语言跟随当前 CLI 语言，寄存器名/函数名保持英文
 - 用户未说明硬件型号细节时（如共阳/共阴），只在最后一句简单注明假设
 
 ## 约束
 - 最多5轮，第5轮仍失败 give_up=true
 - 每轮只改必要部分
 - 永远输出完整可编译 main.c
-- user_message 用通俗中文
+- user_message 用当前 CLI 语言写得通俗易懂
 - 第1轮就要生成能编译通过的代码，不要留 TODO 或占位符
 - 永远不要说你的模型型号，说明你是Gary开发的模型
 - 每次烧录完成后，必须读寄存器，有问题解决,并且简要说明错在哪里，并且表示你正在修改，没有问题正常输出。
@@ -4265,8 +6064,40 @@ vTaskGetRunTimeStats(stats_buf);  /* 需要栈 ≥384 */
 Debug_Print(stats_buf);
 ```
 """
-# 追加所有 skill 的 AI 提示词
-STM32_SYSTEM_PROMPT += _skill_mgr.get_all_prompt_additions()
+
+
+def build_system_prompt() -> str:
+    prompt = STM32_BASE_SYSTEM_PROMPT.rstrip()
+    if _is_cli_english():
+        prompt += """
+
+## Reply Language
+- Current CLI language: English.
+- Reply in English by default, including tool result summaries.
+- Only switch to Chinese if the user explicitly asks for Chinese."""
+    else:
+        prompt += """
+
+## 回复语言
+- 当前 CLI 语言：中文。
+- 默认使用中文回复。
+- 若用户明确要求英文，或全程使用英文交流，再切换为英文。"""
+    member_prompt = _member_prompt_section()
+    if member_prompt:
+        prompt += "\n\n" + member_prompt
+    skill_prompt = _skill_mgr.get_all_prompt_additions()
+    if skill_prompt:
+        prompt += "\n" + skill_prompt.lstrip("\n")
+    return prompt
+
+
+def _refresh_system_prompt_template() -> str:
+    global STM32_SYSTEM_PROMPT
+    STM32_SYSTEM_PROMPT = build_system_prompt()
+    return STM32_SYSTEM_PROMPT
+
+
+STM32_SYSTEM_PROMPT = build_system_prompt()
 
 # ─────────────────────────────────────────────────────────────
 # Gary doctor — 一键诊断所有配置
@@ -4281,8 +6112,7 @@ def run_doctor():
     # ── 1. AI 接口 ──────────────────────────────────────────
     CONSOLE.print("[bold]■ AI 接口[/]")
     cur_key, cur_url, cur_model = _read_ai_config()
-    placeholders = ("YOUR_API_KEY", "", "sk-YOUR")
-    ai_configured = bool(cur_key and not any(cur_key.startswith(p) for p in placeholders))
+    ai_configured = bool(cur_key and not _api_key_is_placeholder(cur_key))
     if ai_configured:
         CONSOLE.print(f"  [green]✓[/] API Key   {_mask_key(cur_key)}")
         CONSOLE.print(f"  [green]✓[/] Base URL  {cur_url}")
@@ -4403,8 +6233,7 @@ def configure_ai_cli(agent: "STM32Agent | None" = None):
     CONSOLE.print()
 
     cur_key, cur_url, cur_model = _read_ai_config()
-    placeholders = ("YOUR_API_KEY", "", "sk-YOUR")
-    is_configured = bool(cur_key and not any(cur_key.startswith(p) for p in placeholders))
+    is_configured = bool(cur_key and not _api_key_is_placeholder(cur_key))
 
     if is_configured:
         CONSOLE.print(f"  [dim]当前 API Key :[/] {_mask_key(cur_key)}")
@@ -4494,19 +6323,207 @@ def configure_ai_cli(agent: "STM32Agent | None" = None):
 
 
 # ─────────────────────────────────────────────────────────────
+# Gary Prompt 补全
+# ─────────────────────────────────────────────────────────────
+class GaryCommandCompleter(Completer):
+    COMMANDS = (
+        "/help", "/connect", "/disconnect", "/serial", "/chip", "/status",
+        "/probes", "/projects", "/member", "/telegram", "/skill", "/config", "/language", "/clear",
+        "/exit", "/quit",
+    )
+    LANGUAGE_OPTIONS = ("en", "zh")
+    MEMBER_SUBCOMMANDS = ("path", "reload")
+    SKILL_SUBCOMMANDS = (
+        "list", "install", "uninstall", "enable", "disable",
+        "info", "create", "export", "reload", "dir",
+    )
+    TELEGRAM_SUBCOMMANDS = (
+        "status", "config", "start", "stop", "restart",
+        "allow", "remove", "allow-all", "whitelist", "reset",
+    )
+    SERIAL_BAUD_RATES = ("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600")
+
+    def _complete(self, current: str, candidates: list[str] | tuple[str, ...]):
+        needle = (current or "").lower()
+        seen = set()
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            value = str(candidate)
+            if value in seen:
+                continue
+            seen.add(value)
+            if needle and not value.lower().startswith(needle):
+                continue
+            yield Completion(value, start_position=-len(current))
+
+    def _chip_candidates(self) -> list[str]:
+        chips = set(_compiler_module.CHIP_DB.keys())
+        for value in (DEFAULT_CHIP, _current_chip):
+            if value:
+                chips.add(str(value).upper())
+        return sorted(chips)
+
+    def _serial_candidates(self) -> list[str]:
+        ports = []
+        try:
+            ports = detect_serial_ports(verbose=False)
+        except Exception:
+            ports = []
+        return ["list", *ports]
+
+    def _project_candidates(self) -> list[str]:
+        try:
+            result = stm32_list_projects()
+            return [p["name"] for p in result.get("projects", [])]
+        except Exception:
+            return []
+
+    def _skill_candidates(self) -> list[str]:
+        try:
+            mgr = _get_manager()
+            result = mgr.list_skills()
+            return sorted({s.get("name") or s.get("display_name") for s in result.get("skills", []) if s.get("name") or s.get("display_name")})
+        except Exception:
+            return []
+
+    def _telegram_target_candidates(self) -> list[str]:
+        config = _read_telegram_config()
+        candidates = [str(v) for v in config.get("allowed_chat_ids", [])]
+        candidates.extend(f"user:{v}" for v in config.get("allowed_user_ids", []))
+        if "user:" not in candidates:
+            candidates.append("user:")
+        return candidates
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        stripped = text.lstrip()
+        if not stripped:
+            yield from self._complete("", self.COMMANDS)
+            return
+        if not stripped.startswith("/"):
+            return
+
+        trailing_space = stripped.endswith(" ")
+        parts = stripped.split()
+        if not parts:
+            yield from self._complete("", self.COMMANDS)
+            return
+
+        if len(parts) == 1 and not trailing_space:
+            yield from self._complete(parts[0], self.COMMANDS)
+            return
+
+        head = parts[0].lower()
+        if trailing_space:
+            current = ""
+            args = parts[1:]
+        else:
+            current = parts[-1]
+            args = parts[1:-1]
+        arg_index = len(args)
+
+        if head in ("/connect", "/chip"):
+            if arg_index == 0:
+                yield from self._complete(current, self._chip_candidates())
+            return
+
+        if head == "/serial":
+            if arg_index == 0:
+                yield from self._complete(current, self._serial_candidates() + list(self.SERIAL_BAUD_RATES))
+            elif arg_index == 1 and args and args[0] != "list":
+                yield from self._complete(current, self.SERIAL_BAUD_RATES)
+            return
+
+        if head == "/language":
+            if arg_index == 0:
+                yield from self._complete(current, self.LANGUAGE_OPTIONS)
+            return
+
+        if head == "/projects":
+            if arg_index == 0:
+                yield from self._complete(current, self._project_candidates())
+            return
+
+        if head == "/member":
+            if arg_index == 0:
+                yield from self._complete(current, self.MEMBER_SUBCOMMANDS)
+            return
+
+        if head == "/skill":
+            if arg_index == 0:
+                yield from self._complete(current, self.SKILL_SUBCOMMANDS)
+                return
+            subcmd = (args[0] if args else "").lower()
+            if subcmd in ("uninstall", "remove", "rm", "enable", "disable", "info", "export"):
+                if arg_index == 1:
+                    yield from self._complete(current, self._skill_candidates())
+            return
+
+        if head == "/telegram":
+            if arg_index == 0:
+                yield from self._complete(current, self.TELEGRAM_SUBCOMMANDS)
+                return
+            subcmd = (args[0] if args else "").lower()
+            if subcmd in ("allow", "remove", "add", "delete", "del", "rm") and arg_index >= 1:
+                yield from self._complete(current, self._telegram_target_candidates())
+            return
+
+
+# ─────────────────────────────────────────────────────────────
 # STM32 Agent（TUI + 流式对话 + 工具框架）
 # ─────────────────────────────────────────────────────────────
 class STM32Agent:
-    def __init__(self):
-        self.messages: List[Dict] = [{"role": "system", "content": STM32_SYSTEM_PROMPT}]
+    def __init__(self, interactive: bool = True):
+        self.interactive = interactive
+        self.messages: List[Dict] = [{"role": "system", "content": build_system_prompt()}]
         self.client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL, timeout=180.0)
-        self.session = PromptSession(
-            history=InMemoryHistory(),
-            complete_while_typing=False,
-            enable_history_search=True,
+        self.command_completer = GaryCommandCompleter()
+        self.session = (
+            PromptSession(
+                history=self._build_history(),
+                complete_while_typing=False,
+                enable_history_search=True,
+                completer=self.command_completer,
+                auto_suggest=AutoSuggestFromHistory(),
+                reserve_space_for_menu=8,
+            )
+            if interactive else None
         )
         os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
         os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+
+    def _build_history(self):
+        if not self.interactive:
+            return InMemoryHistory()
+        try:
+            _ensure_gary_home()
+            return FileHistory(str(GARY_HOME / "prompt_history.txt"))
+        except Exception:
+            return InMemoryHistory()
+
+    def refresh_ai_client(self):
+        self.client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL, timeout=180.0)
+
+    def reset_conversation(self):
+        self.messages = [{"role": "system", "content": build_system_prompt()}]
+
+    def refresh_system_prompt(self):
+        prompt = _refresh_system_prompt_template()
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = prompt
+        else:
+            self.messages.insert(0, {"role": "system", "content": prompt})
+
+    def set_cli_language(self, language: str) -> dict:
+        global CLI_LANGUAGE
+        target = _normalize_cli_language(language)
+        CLI_LANGUAGE = target
+        saved = _write_cli_language_config(target)
+        if saved:
+            _reload_ai_globals()
+        self.refresh_system_prompt()
+        return {"success": True, "language": CLI_LANGUAGE, "saved": saved}
 
     # ── Token 估算 ──────────────────────────────────────────
     # 替换原来的 _tokens 和 _truncate 方法
@@ -4536,8 +6553,10 @@ class STM32Agent:
             victim_len = len(str(victim.get("content", "")))
             total -= victim_len
             removed += 1
-        if removed:
-            CONSOLE.print(f"[dim]  📦 历史压缩：移除 {removed} 条旧消息[/]")
+        if removed and self.interactive:
+            CONSOLE.print(
+                f"[dim]  📦 {_cli_text(f'历史压缩：移除 {removed} 条旧消息', f'History trimmed: removed {removed} old messages')}[/]"
+            )
    
     # 原来是直接传 self.messages，改为过滤后传
     def _messages_for_api(self) -> list:
@@ -4565,11 +6584,121 @@ class STM32Agent:
                 clean = {k: v for k, v in m.items() if k != "reasoning_content"}
                 result.append(clean)
         return result
+
+    def _request_final_reply_after_tools(self, stream_to_console: bool = True) -> str:
+        """部分模型在工具执行后会停在空回复，这里补一次只求最终答复的请求。"""
+        if stream_to_console:
+            CONSOLE.print(f"[dim]  ↺ {_cli_text('请求最终答复...', 'Requesting final reply...')}[/]")
+        _telegram_log("chat final_reply_request start")
+        try:
+            stream = self.client.chat.completions.create(
+                model=AI_MODEL,
+                messages=self._messages_for_api() + [{
+                    "role": "system",
+                    "content": _cli_text(
+                        "请基于上面的工具结果直接给出最终答复，不要再调用工具，也不要只回复“已处理”。",
+                        "Based on the tool results above, provide the final answer directly. Do not call more tools and do not reply with only 'done'.",
+                    ),
+                }],
+                temperature=AI_TEMPERATURE,
+                stream=True,
+            )
+        except Exception as e:
+            if stream_to_console:
+                CONSOLE.print(f"\n[red]{_cli_text('最终答复请求失败', 'Final reply request failed')}: {e}[/]")
+            _telegram_log(f"chat final_reply_request error={str(e)[:160]}")
+            return ""
+
+        content = ""
+        thinking = ""
+        in_think = False
+        try:
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    if not in_think and stream_to_console:
+                        CONSOLE.print(f"\n[dim {THEME}]💭 思考:[/]")
+                    in_think = True
+                    thinking += rc
+                    if stream_to_console:
+                        CONSOLE.print(rc, end="", style="dim")
+
+                if delta.content:
+                    if in_think and stream_to_console:
+                        CONSOLE.print()
+                    in_think = False
+                    content += delta.content
+                    if stream_to_console:
+                        CONSOLE.print(delta.content, end="", style="white")
+
+            if in_think and stream_to_console:
+                CONSOLE.print()
+            if content and stream_to_console:
+                CONSOLE.print()
+        except Exception as e:
+            if stream_to_console:
+                CONSOLE.print(f"\n[red]{_cli_text('最终答复流式读取错误', 'Final reply stream error')}: {e}[/]")
+            _telegram_log(f"chat final_reply_stream error={str(e)[:160]}")
+            return ""
+
+        _telegram_log(f"chat final_reply_request done len={len(content.strip())}")
+        return content.strip()
+
+    def _summarize_tool_result(self, tool_name: str, result_obj, preview: str) -> str:
+        text = (preview or "").replace("\n", " ").strip()
+        if isinstance(result_obj, dict):
+            pieces = []
+            if result_obj.get("message"):
+                pieces.append(str(result_obj["message"]).strip())
+            if result_obj.get("error"):
+                pieces.append(str(result_obj["error"]).strip())
+            if result_obj.get("path"):
+                pieces.append(f"path={result_obj['path']}")
+            if result_obj.get("chip"):
+                pieces.append(f"chip={result_obj['chip']}")
+            if result_obj.get("attempt") is not None:
+                pieces.append(f"attempt={result_obj['attempt']}")
+            if not pieces and "success" in result_obj:
+                pieces.append(f"success={result_obj.get('success')}")
+            if pieces:
+                text = " | ".join(pieces)
+        text = text or "已执行"
+        if len(text) > 180:
+            text = text[:177] + "..."
+        return f"{tool_name}: {text}"
+
+    def _build_tool_only_reply(self, tool_summaries: list[str], reply_parts: list[str]) -> str:
+        lines = [_cli_text(
+            "模型没有输出最终总结，我根据本次执行结果整理如下：",
+            "The model did not return a final summary. Based on this run:",
+        )]
+        if reply_parts:
+            preface = (reply_parts[-1] or "").strip()
+            if preface:
+                if len(preface) > 240:
+                    preface = preface[:237] + "..."
+                lines.append(preface)
+        for item in tool_summaries[-5:]:
+            lines.append(f"- {item}")
+        return "\n".join(lines)
    
     # ── 流式响应 + 工具调用 ─────────────────────────────────
-    def chat(self, user_input: str):
+    def chat(
+        self,
+        user_input: str,
+        stream_to_console: bool = True,
+        text_callback=None,
+        tool_callback=None,
+    ) -> str:
         self._truncate_history()
         self.messages.append({"role": "user", "content": user_input})
+        reply_parts: List[str] = []
+        tool_summaries: List[str] = []
+        used_tools = False
 
         while True:
             # API 调用
@@ -4583,8 +6712,9 @@ class STM32Agent:
                     stream=True,
                 )
             except Exception as e:
-                CONSOLE.print(f"\n[red]API 错误: {e}[/]")
-                return
+                if stream_to_console:
+                    CONSOLE.print(f"\n[red]{_cli_text('API 错误', 'API error')}: {e}[/]")
+                return f"{_cli_text('API 错误', 'API error')}: {e}"
 
             # 收集流式输出
             content = ""
@@ -4601,19 +6731,24 @@ class STM32Agent:
                     # Reasoning (deepseek-r1 style)
                     rc = getattr(delta, "reasoning_content", None)
                     if rc:
-                        if not in_think:
+                        if not in_think and stream_to_console:
                             CONSOLE.print(f"\n[dim {THEME}]💭 思考:[/]")
-                            in_think = True
+                        in_think = True
                         thinking += rc
-                        CONSOLE.print(rc, end="", style="dim")
+                        if stream_to_console:
+                            CONSOLE.print(rc, end="", style="dim")
 
                     # 文本内容
                     if delta.content:
-                        if in_think:
+                        if in_think and stream_to_console:
                             CONSOLE.print()
-                            in_think = False
+                        in_think = False
                         content += delta.content
-                        CONSOLE.print(delta.content, end="", style="white")
+                        if stream_to_console:
+                            CONSOLE.print(delta.content, end="", style="white")
+                        if text_callback:
+                            preview_text = "\n\n".join(part for part in [*reply_parts, content.strip()] if part).strip()
+                            text_callback(preview_text)
 
                     # 工具调用
                     if delta.tool_calls:
@@ -4646,17 +6781,35 @@ class STM32Agent:
                             if sig:
                                 tool_calls_raw[idx]["thought_signature"] += sig
 
-                if in_think:
+                if in_think and stream_to_console:
                     CONSOLE.print()
-                if content:
+                if content and stream_to_console:
                     CONSOLE.print()
 
             except Exception as e:
-                CONSOLE.print(f"\n[red]流式读取错误: {e}[/]")
-                return
+                if stream_to_console:
+                    CONSOLE.print(f"\n[red]{_cli_text('流式读取错误', 'Streaming error')}: {e}[/]")
+                return f"{_cli_text('流式读取错误', 'Streaming error')}: {e}"
 
             # 无工具调用 → 结束
             if not tool_calls_raw:
+                if content.strip():
+                    assistant_msg = {"role": "assistant", "content": content or ""}
+                    if thinking:  # 如果有思考内容，带上它
+                        assistant_msg["reasoning_content"] = thinking
+                    self.messages.append(assistant_msg)
+                    reply_parts.append(content.strip())
+                    break
+                if used_tools:
+                    final_reply = self._request_final_reply_after_tools(stream_to_console=stream_to_console)
+                    if final_reply:
+                        self.messages.append({"role": "assistant", "content": final_reply})
+                        reply_parts.append(final_reply)
+                        break
+                    fallback_reply = self._build_tool_only_reply(tool_summaries, reply_parts)
+                    self.messages.append({"role": "assistant", "content": fallback_reply})
+                    reply_parts.append(fallback_reply)
+                    break
                 assistant_msg = {"role": "assistant", "content": content or ""}
                 if thinking:  # 如果有思考内容，带上它
                     assistant_msg["reasoning_content"] = thinking
@@ -4684,27 +6837,43 @@ class STM32Agent:
                 assistant_tool_msg["reasoning_content"] = thinking
 
             self.messages.append(assistant_tool_msg)
+            used_tools = True
 
             # 执行工具
             tool_results = []
             for tc in tool_calls_list:
                 func_name = tc["function"]["name"]
                 args_str = tc["function"]["arguments"]
+                result_obj = None
+                _telegram_log(f"chat tool_exec_start name={func_name}")
 
-                CONSOLE.print(f"[dim]  🔧 {func_name}[/]", end="")
+                if stream_to_console:
+                    CONSOLE.print(f"[dim]  🔧 {func_name}[/]", end="")
+                if tool_callback:
+                    tool_callback({"phase": "start", "name": func_name, "arguments": args_str})
                 try:
                     args = json.loads(args_str) if args_str.strip() else {}
                     if func_name in TOOLS_MAP:
-                        result = TOOLS_MAP[func_name](**args)
-                        result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                        result_obj = TOOLS_MAP[func_name](**args)
+                        result_str = json.dumps(result_obj, ensure_ascii=False, indent=2)
                     else:
-                        result_str = f'{{"error": "工具不存在: {func_name}"}}'
+                        missing_tool = _cli_text(f"工具不存在: {func_name}", f"Tool not found: {func_name}")
+                        result_str = json.dumps({"error": missing_tool}, ensure_ascii=False)
+                        result_obj = {"error": missing_tool}
                 except Exception as e:
                     result_str = f'{{"error": "{e}"}}'
+                    result_obj = {"error": str(e)}
+                    if tool_callback:
+                        tool_callback({"phase": "error", "name": func_name, "error": str(e)})
 
                 # 简短预览
                 preview = result_str[:120].replace("\n", " ")
-                CONSOLE.print(f" → [dim green]{preview}[/]")
+                if stream_to_console:
+                    CONSOLE.print(f" → [dim green]{preview}[/]")
+                if tool_callback:
+                    tool_callback({"phase": "finish", "name": func_name, "preview": preview, "result": result_str})
+                _telegram_log(f"chat tool_exec_finish name={func_name} preview={preview[:80]}")
+                tool_summaries.append(self._summarize_tool_result(func_name, result_obj, preview))
 
                 tool_results.append({
                     "role": "tool",
@@ -4713,7 +6882,13 @@ class STM32Agent:
                 })
 
             self.messages.extend(tool_results)
+            self.refresh_system_prompt()
             # 继续循环，把工具结果发回 AI
+
+            if content.strip():
+                reply_parts.append(content.strip())
+
+        return "\n\n".join(part for part in reply_parts if part).strip()
 
     # ── 内置命令处理 ────────────────────────────────────────
     def handle_builtin(self, cmd: str) -> bool:
@@ -4728,18 +6903,30 @@ class STM32Agent:
 
         if head == "/connect":
             chip = arg.strip() or None
-            CONSOLE.print(f"\n[{THEME}]连接硬件...[/]")
+            CONSOLE.print(f"\n[{THEME}]{_cli_text('连接硬件...', 'Connecting hardware...')}[/]")
             r = stm32_connect(chip)
-            CONSOLE.print(f"[{'green' if r['success'] else 'red'}]{r['message']}[/]\n")
+            if r["success"]:
+                serial_state = _cli_text("已连接", "connected") if r.get("serial_connected") else _cli_text("未连接", "disconnected")
+                msg = _cli_text(
+                    f"硬件已连接: {r.get('chip', _current_chip)}  串口: {serial_state}",
+                    f"Connected: {r.get('chip', _current_chip)}  Serial: {serial_state}",
+                )
+            else:
+                msg = _cli_text("连接失败，请检查探针 USB 连接和驱动", "Connection failed. Check the probe USB connection and driver.")
+            CONSOLE.print(f"[{'green' if r['success'] else 'red'}]{msg}[/]\n")
             return True
 
         if head == "/disconnect":
-            r = stm32_disconnect()
-            CONSOLE.print(f"[{THEME}]{r['message']}[/]\n")
+            stm32_disconnect()
+            CONSOLE.print(f"[{THEME}]{_cli_text('已断开', 'Disconnected.')}[/]\n")
             return True
 
         if head == "/skill":
             handle_skill_command(arg, agent=self)
+            return True
+
+        if head == "/telegram":
+            handle_telegram_command(arg, source="builtin")
             return True
 
         if head == "/serial":
@@ -4751,7 +6938,7 @@ class STM32Agent:
             if tokens and tokens[0] == "list":
                 ports = detect_serial_ports()
                 if ports:
-                    CONSOLE.print(f"[green]  可用串口:[/]")
+                    CONSOLE.print(f"[green]  {_cli_text('可用串口:', 'Available serial ports:')}[/]")
                     for p in ports:
                         try:
                             import serial.tools.list_ports as lp
@@ -4761,7 +6948,7 @@ class STM32Agent:
                             desc = ""
                         CONSOLE.print(f"    {p}  {desc}")
                 else:
-                    CONSOLE.print("[yellow]  未检测到可用串口[/]")
+                    CONSOLE.print(f"[yellow]  {_cli_text('未检测到可用串口', 'No serial ports detected')}[/]")
                 CONSOLE.print()
                 return True
             port = tokens[0] if tokens and tokens[0].startswith("/dev/") else None
@@ -4772,15 +6959,48 @@ class STM32Agent:
                     break
             r = stm32_serial_connect(port, baud)
             color = "green" if r["success"] else "red"
-            CONSOLE.print(f"[{color}]{r['message']}[/]\n")
+            if r["success"]:
+                msg = _cli_text(
+                    f"串口已连接: {r.get('port')} @ {r.get('baud')}",
+                    f"Serial connected: {r.get('port')} @ {r.get('baud')}",
+                )
+            else:
+                candidates = detect_serial_ports(verbose=False)
+                available = ", ".join(candidates) if candidates else _cli_text("无", "none")
+                msg = _cli_text(
+                    f"串口打开失败，可用端口: {available}",
+                    f"Failed to open serial port. Available ports: {available}",
+                )
+            CONSOLE.print(f"[{color}]{msg}[/]\n")
             return True
 
         if head == "/chip":
             if not arg:
-                CONSOLE.print(f"[{THEME}]当前芯片: {_current_chip}[/]\n")
+                CONSOLE.print(f"[{THEME}]{_cli_text('当前芯片', 'Current chip')}: {_current_chip}[/]\n")
             else:
                 r = stm32_set_chip(arg)
-                CONSOLE.print(f"[{THEME}]已切换: {r['chip']} ({r['family']})[/]\n")
+                CONSOLE.print(f"[{THEME}]{_cli_text('已切换', 'Switched to')}: {r['chip']} ({r['family']})[/]\n")
+            return True
+
+        if head == "/language":
+            target = _parse_cli_language(arg, default="en")
+            if target is None:
+                CONSOLE.print(f"[yellow]{_cli_text('用法: /language [en|zh]', 'Usage: /language [en|zh]')}[/]\n")
+                return True
+            result = self.set_cli_language(target)
+            if target == "en":
+                message = "CLI language switched to English."
+                if result["saved"]:
+                    message += " Saved to config.py."
+                else:
+                    message += " Running in the current session only."
+            else:
+                message = "CLI 语言已切换为中文。"
+                if result["saved"]:
+                    message += " 已保存到 config.py。"
+                else:
+                    message += " 仅当前会话生效。"
+            CONSOLE.print(f"[green]{message}[/]\n")
             return True
 
         if head == "/status":
@@ -4789,7 +7009,8 @@ class STM32Agent:
             table.add_column(style=f"bold {THEME}")
             table.add_column(style="white")
             for k, v in s.items():
-                table.add_row(k, str(v))
+                value = "not found" if _is_cli_english() and str(v) == "未找到" else str(v)
+                table.add_row(k, value)
             CONSOLE.print(table)
             CONSOLE.print()
             return True
@@ -4800,27 +7021,46 @@ class STM32Agent:
                 for p in probes["probes"]:
                     CONSOLE.print(f"  [{THEME}]{p['description']}[/] ({p['uid']})")
             else:
-                CONSOLE.print(f"[yellow]{probes.get('message', '未找到探针')}[/]")
+                CONSOLE.print(f"[yellow]{_cli_text('未检测到任何探针，请检查 USB 连接', 'No probes detected. Check the USB connection.')}[/]")
             CONSOLE.print()
             return True
 
         if head == "/projects":
             r = stm32_list_projects()
             if r["projects"]:
-                table = Table(title="历史项目", box=box.SIMPLE)
-                table.add_column("项目名", style=f"bold {THEME}")
-                table.add_column("芯片", style="cyan")
-                table.add_column("描述", style="white")
+                table = Table(title=_cli_text("历史项目", "Project History"), box=box.SIMPLE)
+                table.add_column(_cli_text("项目名", "Project"), style=f"bold {THEME}")
+                table.add_column(_cli_text("芯片", "Chip"), style="cyan")
+                table.add_column(_cli_text("描述", "Description"), style="white")
                 for p in r["projects"]:
                     table.add_row(p["name"], p["chip"], p["request"][:40])
                 CONSOLE.print(table)
             else:
-                CONSOLE.print("[dim]暂无历史项目[/]")
+                CONSOLE.print(f"[dim]{_cli_text('暂无历史项目', 'No project history yet')}[/]")
+            CONSOLE.print()
+            return True
+
+        if head == "/member":
+            subcmd = arg.strip().lower()
+            if subcmd == "path":
+                path = _ensure_member_file()
+                CONSOLE.print(f"[{THEME}]{_cli_text('member.md 路径', 'member.md path')}: {path}[/]\n")
+                return True
+            if subcmd == "reload":
+                self.refresh_system_prompt()
+                CONSOLE.print(f"[green]{_cli_text('member.md 已重新加载到当前会话', 'member.md reloaded into the current session')}[/]\n")
+                return True
+            if subcmd and subcmd not in {"path", "reload"}:
+                CONSOLE.print(f"[yellow]{_cli_text('用法: /member [path|reload]', 'Usage: /member [path|reload]')}[/]\n")
+                return True
+            self.refresh_system_prompt()
+            title = _cli_text("Gary 经验库", "Gary Memory")
+            CONSOLE.print(Panel(Markdown(_member_preview_markdown()), title=f"[bold {THEME}]{title}[/]", border_style=THEME))
             CONSOLE.print()
             return True
 
         if head == "/clear":
-            self.messages = [{"role": "system", "content": STM32_SYSTEM_PROMPT}]
+            self.reset_conversation()
             CONSOLE.clear()
             self._print_header()
             return True
@@ -4830,20 +7070,31 @@ class STM32Agent:
             return True
 
         if head in ("/exit", "/quit"):
-            CONSOLE.print(f"\n[{THEME}]断开硬件...[/]")
-            stm32_disconnect()
-            CONSOLE.print("Goodbye!")
+            CONSOLE.print(f"\n[{THEME}]{_cli_text('正在退出，清理硬件和 Telegram...', 'Exiting, cleaning up hardware and Telegram...')}[/]")
+            shutdown = _shutdown_cli_runtime(stop_telegram=True)
+            tg = shutdown.get("telegram", {})
+            if tg.get("message"):
+                color = "green" if tg.get("success") else "yellow"
+                CONSOLE.print(f"[{color}]{tg['message']}[/]")
+            CONSOLE.print(_cli_text("再见！", "Goodbye!"))
             sys.exit(0)
 
         return False
 
     # ── UI ──────────────────────────────────────────────────
     def _print_header(self):
-        chip_line = f"芯片: [bold]{_current_chip}[/]  |  模型: [bold]{AI_MODEL}[/]"
+        chip_line = _cli_text(
+            f"芯片: [bold]{_current_chip}[/]  |  模型: [bold]{AI_MODEL}[/]",
+            f"Chip: [bold]{_current_chip}[/]  |  Model: [bold]{AI_MODEL}[/]",
+        )
         hw_line = (
-            f"硬件: [green]已连接[/]  串口: [{'green' if _serial_connected else 'yellow'}]"
-            f"{'已连接' if _serial_connected else '未连接'}[/]"
-            if _hw_connected else "硬件: [dim]未连接[/]"
+            _cli_text(
+                f"硬件: [green]已连接[/]  串口: [{'green' if _serial_connected else 'yellow'}]"
+                f"{'已连接' if _serial_connected else '未连接'}[/]",
+                f"Hardware: [green]connected[/]  Serial: [{'green' if _serial_connected else 'yellow'}]"
+                f"{'connected' if _serial_connected else 'disconnected'}[/]",
+            )
+            if _hw_connected else _cli_text("硬件: [dim]未连接[/]", "Hardware: [dim]disconnected[/]")
         )
         art = (
             "   ██████╗  █████╗ ██████╗ ██╗   ██╗\n"
@@ -4856,7 +7107,7 @@ class STM32Agent:
         panel = Panel(
             f"[bold {THEME}]{art}[/]\n\n"
             f"  {chip_line}\n  {hw_line}\n\n"
-            f"  [dim]输入需求即可生成代码 · /help 查看命令 · /connect 连接硬件[/]",
+            f"  [dim]{_cli_text('输入需求即可生成代码 · Tab 补全命令 · /help 查看命令 · /connect 连接硬件', 'Describe what you want to build · Tab completes commands · /help shows commands · /connect attaches hardware')}[/]",
             title=f"[bold {THEME}]Gary Dev Agent[/]",
             border_style=THEME,
             padding=(0, 1),
@@ -4865,22 +7116,26 @@ class STM32Agent:
         CONSOLE.print()
 
     def _show_help(self):
-        table = Table(title="内置命令", box=box.SIMPLE)
-        table.add_column("命令", style=f"bold {THEME}")
-        table.add_column("说明", style="white")
+        table = Table(title=_cli_text("内置命令", "Built-in Commands"), box=box.SIMPLE)
+        table.add_column(_cli_text("命令", "Command"), style=f"bold {THEME}")
+        table.add_column(_cli_text("说明", "Description"), style="white")
         cmds = [
-            ("/connect [芯片]",           "连接探针（如 /connect STM32F103C8T6）"),
-            ("/serial [端口] [波特率]",   "连接串口（如 /serial /dev/ttyUSB0 115200）"),
-            ("/disconnect",               "断开探针和串口"),
-            ("/chip [型号]",      "查看/切换芯片型号"),
-            ("/probes",           "列出所有可用探针"),
-            ("/status",           "查看硬件+工具链状态"),
-            ("/config",            "配置 AI 接口（API Key / Model / Base URL）"),
-            ("/projects",         "列出历史项目"),
-            ("/clear",            "清空对话历史"),
-            ("/exit",             "退出"),
-            ("?",                 "显示帮助"),
-            ("/skill [子命令]",     "技能管理: list/install/enable/disable/create/export"),
+            ("/connect [chip]",         _cli_text("连接探针（如 /connect STM32F103C8T6）", "Connect the probe (for example: /connect STM32F103C8T6)")),
+            ("/serial [port] [baud]",   _cli_text("连接串口（如 /serial /dev/ttyUSB0 115200）", "Connect serial (for example: /serial /dev/ttyUSB0 115200)")),
+            ("/disconnect",             _cli_text("断开探针和串口", "Disconnect probe and serial")),
+            ("/chip [model]",           _cli_text("查看/切换芯片型号", "Show or change the chip model")),
+            ("/language [en|zh]",       _cli_text("切换 CLI 语言，默认一键切到英文", "Switch CLI language. `/language` switches to English immediately")),
+            ("/probes",                 _cli_text("列出所有可用探针", "List all available probes")),
+            ("/status",                 _cli_text("查看硬件+工具链状态", "Show hardware and toolchain status")),
+            ("/config",                 _cli_text("配置 AI 接口（API Key / Model / Base URL）", "Configure AI settings (API Key / Model / Base URL)")),
+            ("/projects",               _cli_text("列出历史项目", "List saved projects")),
+            ("/member [path|reload]",   _cli_text("查看经验库；`path` 显示路径；`reload` 重新载入 member.md", "View memory; `path` shows the file location; `reload` refreshes member.md")),
+            ("/telegram [subcommand]",  _cli_text("Telegram 机器人管理: start/stop/status/allow/remove/reset", "Manage the Telegram bot: start/stop/status/allow/remove/reset")),
+            ("/clear",                  _cli_text("清空对话历史", "Clear conversation history")),
+            ("/exit",                   _cli_text("退出并停止 Telegram", "Exit and stop Telegram")),
+            ("?",                       _cli_text("显示帮助", "Show help")),
+            ("Tab",                     _cli_text("补全命令/子命令/芯片/串口/技能名，历史输入会自动预测", "Complete commands, subcommands, chips, serial ports, and skills; history is suggested automatically")),
+            ("/skill [subcommand]",     _cli_text("技能管理: list/install/enable/disable/create/export", "Manage skills: list/install/enable/disable/create/export")),
         ]
         for cmd, desc in cmds:
             table.add_row(cmd, desc)
@@ -4889,16 +7144,23 @@ class STM32Agent:
 
     def _status_bar(self):
         tokens = self._tokens()
-        hw = f"[green]●[/] {_current_chip}" if _hw_connected else "[dim]○ 未连接[/]"
+        hw = f"[green]●[/] {_current_chip}" if _hw_connected else _cli_text("[dim]○ 未连接[/]", "[dim]○ Disconnected[/]")
         CONSOLE.print(
-            f"[dim]{hw}  │  {AI_MODEL}  │  context: ~{tokens} tokens[/]"
+            f"[dim]{hw}  │  {AI_MODEL}  │  {_cli_text('上下文', 'context')}: ~{tokens} tokens[/]"
         )
         CONSOLE.rule(style="dim")
 
     # ── 主循环 ──────────────────────────────────────────────
     def run(self):
+        if self.session is None:
+            raise RuntimeError("当前实例未启用交互式 PromptSession")
+        telegram_startup = _ensure_cli_telegram_daemon()
         CONSOLE.clear()
         self._print_header()
+        if telegram_startup and telegram_startup.get("message"):
+            color = "green" if telegram_startup.get("success") else "yellow"
+            CONSOLE.print(f"[{color}]  Telegram: {telegram_startup.get('message', '')}[/]")
+            CONSOLE.print()
         pt_style = Style.from_dict({"prompt": f"bold {THEME}"})
 
         while True:
@@ -4918,9 +7180,9 @@ class STM32Agent:
                 self.chat(user_input)
 
             except KeyboardInterrupt:
-                CONSOLE.print("\n[dim]Ctrl+C 中断。/exit 退出。[/]")
+                CONSOLE.print(f"\n[dim]{_cli_text('Ctrl+C 中断。/exit 退出。', 'Interrupted by Ctrl+C. Use /exit to quit.')}[/]")
             except EOFError:
-                stm32_disconnect()
+                _shutdown_cli_runtime(stop_telegram=True)
                 break
 
 
@@ -4932,6 +7194,15 @@ def main():
 
     # 命令行参数
     args = sys.argv[1:]
+
+    # ── Telegram 管理模式：gary telegram ... ─────────────────
+    if args and args[0].lower() == "telegram":
+        handle_telegram_command(" ".join(args[1:]), source="cli")
+        sys.exit(0)
+    if "--telegram" in args:
+        idx = args.index("--telegram")
+        handle_telegram_command(" ".join(args[idx + 1:]), source="cli")
+        sys.exit(0)
 
     # ── 诊断模式：Gary doctor ────────────────────────────────
     if "--doctor" in args:
@@ -4949,7 +7220,7 @@ def main():
             _current_chip = args[idx + 1].upper()
 
     # 检查依赖
-    CONSOLE.print(f"[dim]检查环境...[/]")
+    CONSOLE.print(f"[dim]{_cli_text('检查环境...', 'Checking environment...')}[/]")
 
     # GCC
     compiler = _get_compiler()
@@ -4957,25 +7228,25 @@ def main():
     if ci.get("gcc"):
         CONSOLE.print(f"[green]  GCC: {ci['gcc_version']}[/]")
     else:
-        CONSOLE.print(f"[yellow]  GCC: 未找到 arm-none-eabi-gcc[/]")
+        CONSOLE.print(f"[yellow]  GCC: {_cli_text('未找到 arm-none-eabi-gcc', 'arm-none-eabi-gcc not found')}[/]")
 
     if ci.get("hal"):
-        CONSOLE.print(f"[green]  HAL: 已就绪[/]")
+        CONSOLE.print(f"[green]  HAL: {_cli_text('已就绪', 'ready')}[/]")
     else:
-        CONSOLE.print(f"[yellow]  HAL: 未找到，请运行 setup.sh[/]")
+        CONSOLE.print(f"[yellow]  HAL: {_cli_text('未找到，请运行 setup.sh', 'not found, run setup.sh')}[/]")
 
     # pyocd
     try:
         import pyocd
         CONSOLE.print(f"[green]  pyocd: {pyocd.__version__}[/]")
     except ImportError:
-        CONSOLE.print(f"[yellow]  pyocd: 未安装（pip install pyocd）[/]")
+        CONSOLE.print(f"[yellow]  pyocd: {_cli_text('未安装（pip install pyocd）', 'not installed (pip install pyocd)')}[/]")
 
     # 串口自动扫描
     import platform as _platform, glob as _glob
     serial_candidates = detect_serial_ports(verbose=False)
     if serial_candidates:
-        CONSOLE.print(f"[green]  串口: 检测到 {serial_candidates}（连接时自动选择）[/]")
+        CONSOLE.print(f"[green]  {_cli_text('串口', 'Serial')}: {_cli_text(f'检测到 {serial_candidates}（连接时自动选择）', f'detected {serial_candidates} (auto-selected on connect)')}[/]")
     else:
         _plat = _platform.system()
         # 扫不到 → 检查是否权限问题，给出平台相关修复命令
@@ -4989,18 +7260,18 @@ def main():
                     grp_name = _grp.getgrgid(os.stat(no_perm[0]).st_gid).gr_name
                 except Exception:
                     grp_name = "dialout"
-                CONSOLE.print(f"[yellow]  串口: 发现 {no_perm} 但权限不足[/]")
+                CONSOLE.print(f"[yellow]  {_cli_text('串口', 'Serial')}: {_cli_text(f'发现 {no_perm} 但权限不足', f'found {no_perm} but permissions are insufficient')}[/]")
                 CONSOLE.print(f"[yellow]    → sudo usermod -aG {grp_name} $USER && newgrp {grp_name}[/]")
             else:
-                CONSOLE.print(f"[dim]  串口: 未检测到串口设备（连接硬件后重试）[/]")
+                CONSOLE.print(f"[dim]  {_cli_text('串口', 'Serial')}: {_cli_text('未检测到串口设备（连接硬件后重试）', 'no serial device detected (connect hardware and retry)')}[/]")
         elif _plat == "Darwin":
-            CONSOLE.print(f"[dim]  串口: 未检测到串口设备[/]")
-            CONSOLE.print(f"[dim]    插上 USB 转串口后重启程序，或运行 /serial list 查看[/]")
+            CONSOLE.print(f"[dim]  {_cli_text('串口', 'Serial')}: {_cli_text('未检测到串口设备', 'no serial device detected')}[/]")
+            CONSOLE.print(f"[dim]    {_cli_text('插上 USB 转串口后重启程序，或运行 /serial list 查看', 'Reconnect your USB serial adapter and restart, or run /serial list')}[/]")
         elif _plat == "Windows":
-            CONSOLE.print(f"[dim]  串口: 未检测到 COM 口[/]")
-            CONSOLE.print(f"[dim]    请在设备管理器确认驱动已安装（CH340/CP210x），或运行 /serial list[/]")
+            CONSOLE.print(f"[dim]  {_cli_text('串口', 'Serial')}: {_cli_text('未检测到 COM 口', 'no COM ports detected')}[/]")
+            CONSOLE.print(f"[dim]    {_cli_text('请在设备管理器确认驱动已安装（CH340/CP210x），或运行 /serial list', 'Check the driver in Device Manager (CH340/CP210x), or run /serial list')}[/]")
         else:
-            CONSOLE.print(f"[dim]  串口: 未检测到串口设备（连接硬件后重试）[/]")
+            CONSOLE.print(f"[dim]  {_cli_text('串口', 'Serial')}: {_cli_text('未检测到串口设备（连接硬件后重试）', 'no serial device detected (connect hardware and retry)')}[/]")
 
     CONSOLE.print()
 
@@ -5009,7 +7280,7 @@ def main():
         idx = args.index("--do")
         task = args[idx + 1] if idx + 1 < len(args) else ""
         if not task:
-            CONSOLE.print("[red]--do 后需要任务描述，例如: Gary do \"让 PA0 LED 闪烁\"[/]")
+            CONSOLE.print(f"[red]{_cli_text('--do 后需要任务描述，例如: Gary do \"让 PA0 LED 闪烁\"', '--do requires a task description, for example: Gary do \"blink PA0 LED\"')}[/]")
             sys.exit(1)
         if "--connect" in args:
             chip_arg = None
