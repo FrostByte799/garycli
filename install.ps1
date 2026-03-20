@@ -103,7 +103,6 @@ if ($LASTEXITCODE -ne 0) { die "setup.py 执行失败" }
 # ── 8. 生成 gary 启动包装脚本 ────────────────────────────────────
 $LOCAL_BIN = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force -Path $LOCAL_BIN | Out-Null
-
 $GARY_BAT = "$LOCAL_BIN\gary.bat"
 @"
 @echo off
@@ -113,8 +112,19 @@ set HTTP_PROXY=
 set http_proxy=
 set HTTPS_PROXY=
 set https_proxy=
-"$GARY_VENV\Scripts\python.exe" -m gary %*
+set GARY_SCRIPT=$GARY_DIR\stm32_agent.py
+if "%1"=="do" (
+    shift
+    "$GARY_VENV\Scripts\python.exe" "%GARY_SCRIPT%" --do %*
+) else if "%1"=="doctor" (
+    "$GARY_VENV\Scripts\python.exe" "%GARY_SCRIPT%" --doctor
+) else if "%1"=="config" (
+    "$GARY_VENV\Scripts\python.exe" "%GARY_SCRIPT%" --config
+) else (
+    "$GARY_VENV\Scripts\python.exe" "%GARY_SCRIPT%" %*
+)
 "@ | Set-Content -Encoding ASCII $GARY_BAT
+
 ok "启动脚本已写入 $GARY_BAT"
 
 # ── 9. 添加 %USERPROFILE%\.local\bin 到用户 PATH ─────────────────
