@@ -1,0 +1,61 @@
+name: 💡 Feature Request
+description: 建议新功能或改进 / Suggest a new feature or improvement
+title: "[Feature] "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        有好想法？告诉我们！请从使用场景出发描述，而不只是技术实现。
+        Got an idea? Tell us about it! Please frame it as a use case, not just a technical spec.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 这个功能解决什么问题？/ What problem does this solve?
+      placeholder: |
+        我在做 XXX 的时候，发现 Gary 目前无法 ...
+        When I'm trying to do XXX, Gary currently can't ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: 你期望的解决方案 / Proposed Solution
+      placeholder: |
+        理想情况下，我希望能 ...
+        Ideally, I'd like to be able to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过哪些替代方案？/ Alternatives Considered
+      placeholder: 目前我通过 XXX 绕过这个问题，但不够方便 ...
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及功能区域 / Feature Area
+      multiple: true
+      options:
+        - 代码生成 / Code Generation
+        - 编译流程 / Compilation
+        - 烧录 / Flashing
+        - 串口调试 / Serial Debugging
+        - Skill 系统 / Skill System
+        - AI 后端 / AI Backend
+        - 芯片支持 / Chip Support
+        - CLI 命令 / CLI Commands
+        - 文档 / Documentation
+        - 其他 / Other
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: 你是否愿意为此提交 PR？/ Would you like to contribute a PR?
+      options:
+        - label: 是的，我愿意尝试实现这个功能 / Yes, I'd like to implement this
