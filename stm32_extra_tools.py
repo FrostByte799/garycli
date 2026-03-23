@@ -547,7 +547,7 @@ def stm32_pwm_sweep(
     array_code += f"typedef struct {{ uint16_t psc; uint16_t arr; uint16_t ccr; }} PWM_Config;\n"
     array_code += f"const PWM_Config pwm_table[{len(configs)}] = {{\n"
     for c in configs:
-        array_code += f"    {{{c['psc']}, {c['arr']}, {c['duty_50_ccr']}}},  /* {c['actual_freq']:.1f} Hz */\n"
+        array_code += f"    {{{c['psc']}, {c['arr']}, {c['duty_50_ccr']}}},  /* {c['actual_freq']:.1f} Hz */\n" # noqa: E501
     array_code += "};\n"
 
     sweep_code = f"""
