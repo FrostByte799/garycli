@@ -1,0 +1,68 @@
+name: 🧩 Skill Submission
+description: 提交一个新的 Skill 包 / Submit a new Skill pack
+title: "[Skill] "
+labels: ["skill"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你为 Gary 的 Skill 生态做出贡献！
+        Thanks for contributing to Gary's Skill ecosystem!
+
+  - type: input
+    id: skill-name
+    attributes:
+      label: Skill 名称 / Skill Name
+      placeholder: "e.g. uart_protocol_analyzer"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 功能描述 / Description
+      placeholder: 这个 Skill 做什么？解决什么问题？
+    validations:
+      required: true
+
+  - type: textarea
+    id: usage
+    attributes:
+      label: 使用示例 / Usage Example
+      placeholder: |
+        Gary > 帮我分析这段 UART 抓包数据 ...
+        Gary > Analyze this UART capture ...
+    validations:
+      required: true
+
+  - type: input
+    id: tested-chip
+    attributes:
+      label: 测试芯片 / Tested Chip(s)
+      placeholder: "e.g. STM32F103C8T6, STM32F407VET6"
+    validations:
+      required: true
+
+  - type: input
+    id: skill-repo
+    attributes:
+      label: Skill 源码链接 / Skill Source URL
+      placeholder: "https://github.com/yourname/gary-skill-xxx"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前检查 / Pre-submission Checklist
+      options:
+        - label: skill.json 中填写了正确的 author 字段
+          required: true
+        - label: tools.py 中每个工具函数都有 docstring
+          required: true
+        - label: schemas.json 中每个 function 都有清晰的 description
+          required: true
+        - label: 已在本地通过 `/skill install` + `/skill reload` 测试
+          required: true
+        - label: 如 Skill 有网络请求，已在 prompt.md 中注明
