@@ -8,26 +8,32 @@ on:
 
 jobs:
   lint:
-    name: Python Lint & Format Check
+    name: Python Lint & Format
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install lint tools
-        run: |
-          pip install black flake8
+      - name: Install tools
+        run: pip install "black>=24.0" flake8
 
-      - name: Check formatting with black
+      - name: Auto-format with black
+        run: black . --line-length 100
+
+      - name: Commit formatting fixes (if any)
         run: |
-          black --check --diff . --line-length 100
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet || (git add . && git commit -m "style: auto-format with black")
+          git push
 
       - name: Lint with flake8
-        run: |
-          flake8 . --max-line-length=100 --exclude=.venv,__pycache__,*.egg-info
+        run: flake8 . --max-line-length=100 --exclude=.venv,__pycache__,*.egg-info
