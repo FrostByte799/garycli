@@ -23,6 +23,20 @@ def build_system_prompt(chip: str, language: str, hw_connected: bool) -> str:
     prompt = _load_template(template_name)
     chip_name = (chip or "").strip().upper() or "UNKNOWN"
     if normalized_language == "en":
+        prompt += (
+            "\n\n## Reply Language\n"
+            "- Current CLI language: English.\n"
+            "- Reply in English by default, including tool result summaries.\n"
+            "- Only switch to Chinese if the user explicitly asks for Chinese."
+        )
+    else:
+        prompt += (
+            "\n\n## 回复语言\n"
+            "- 当前 CLI 语言：中文。\n"
+            "- 默认使用中文回复。\n"
+            "- 若用户明确要求英文，或全程使用英文交流，再切换为英文。"
+        )
+    if normalized_language == "en":
         dynamic = (
             "\n\n## Runtime Context\n"
             f"- Current chip: `{chip_name}`\n"
@@ -41,4 +55,3 @@ def build_system_prompt(chip: str, language: str, hw_connected: bool) -> str:
             "- 若硬件未连接，优先走可编译路径，并明确说明无法做运行时验证。"
         )
     return prompt.rstrip() + dynamic
-
