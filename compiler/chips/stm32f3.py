@@ -22,4 +22,3 @@ class STM32F3Compiler(ChipCompiler):
     def get_flash_command(self, bin_path: str | Path, chip: str) -> list[str]:
         """Return the pyOCD flash command for the selected STM32F3 chip."""
         return self._build_flash_command(bin_path, chip)
-

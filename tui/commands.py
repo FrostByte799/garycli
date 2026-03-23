@@ -17,6 +17,7 @@ from tui.ui import Markdown, Panel, Table, box, console
 try:
     from prompt_toolkit.completion import Completer, Completion
 except Exception:  # pragma: no cover - optional dependency fallback
+
     class Completer:  # type: ignore[override]
         """Fallback base class when prompt_toolkit is unavailable."""
 
@@ -432,7 +433,11 @@ def handle_slash_command(
         result = agent.set_cli_language(target)
         if target == "en":
             message = "CLI language switched to English."
-            message += " Saved to config.py." if result["saved"] else " Running in the current session only."
+            message += (
+                " Saved to config.py."
+                if result["saved"]
+                else " Running in the current session only."
+            )
         else:
             message = "CLI 语言已切换为中文。"
             message += " 已保存到 config.py。" if result["saved"] else " 仅当前会话生效。"
@@ -481,9 +486,7 @@ def handle_slash_command(
         subcmd = arg.strip().lower()
         if subcmd == "path":
             path = _ensure_member_file()
-            console.print(
-                f"[{theme}]{cli_text('member.md 路径', 'member.md path')}: {path}[/]\n"
-            )
+            console.print(f"[{theme}]{cli_text('member.md 路径', 'member.md path')}: {path}[/]\n")
             return True
         if subcmd == "reload":
             agent.refresh_system_prompt()

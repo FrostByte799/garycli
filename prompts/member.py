@@ -53,4 +53,3 @@ def get_member_prompt_section() -> str:
         "遇到新的高价值经验时，调用 `gary_save_member_memory` 写进去。\n\n"
         f"{excerpt.strip()}"
     )
-

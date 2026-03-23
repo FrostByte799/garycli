@@ -33,4 +33,3 @@ def get_context() -> HardwareContext:
     """Return the process-wide runtime context singleton."""
 
     return _CONTEXT
-

@@ -163,7 +163,9 @@ class SerialMonitor:
             return False
 
         if port:
-            candidates = [port] + [item for item in detect_serial_ports(console=self.console) if item != port]
+            candidates = [port] + [
+                item for item in detect_serial_ports(console=self.console) if item != port
+            ]
         else:
             candidates = detect_serial_ports(console=self.console)
             if not candidates:

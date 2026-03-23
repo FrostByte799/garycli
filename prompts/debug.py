@@ -56,4 +56,3 @@ def get_debug_prompt(error_type: str, context: dict[str, Any]) -> str:
     else:
         prompt = "## 通用诊断\n- 优先基于工具返回值和最新寄存器/串口结果做最小修改。"
     return prompt + _render_context(context)
-

@@ -1113,7 +1113,9 @@ class ChipCompiler(ABC):
             hal_delay_pos = source_text.find("HAL_Delay")
             xtask_pos = source_text.find("xTaskCreate")
             if hal_delay_pos >= 0 and xtask_pos >= 0 and hal_delay_pos < xtask_pos:
-                code_warnings.append("⚠ HAL_Delay() 在 xTaskCreate() 之前调用，可能破坏 FreeRTOS 内部数据结构")
+                code_warnings.append(
+                    "⚠ HAL_Delay() 在 xTaskCreate() 之前调用，可能破坏 FreeRTOS 内部数据结构"
+                )
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
@@ -1218,7 +1220,9 @@ class ChipCompiler(ABC):
             info["chip_info"] = self.set_chip(_default_chip_name())
 
         try:
-            result = subprocess.run([ARM_GCC, "--version"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                [ARM_GCC, "--version"], capture_output=True, text=True, timeout=5
+            )
             if result.returncode == 0:
                 self.has_gcc = True
                 info["gcc"] = True
@@ -1444,4 +1448,6 @@ class ChipCompiler(ABC):
 
         hal_src = HAL_DIR / "Src"
         needed = _FAMILY_HAL_FILES.get(family, [])
-        self.hal_src_files = [str(hal_src / filename) for filename in needed if (hal_src / filename).exists()]
+        self.hal_src_files = [
+            str(hal_src / filename) for filename in needed if (hal_src / filename).exists()
+        ]

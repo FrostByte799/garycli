@@ -127,9 +127,7 @@ def _is_ai_configured() -> bool:
     """Return whether the AI client is configured."""
 
     if _HOOKS.is_ai_configured is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: is_ai_configured is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: is_ai_configured is missing")
     return bool(_HOOKS.is_ai_configured())
 
 
@@ -145,9 +143,7 @@ def _hardware_status() -> dict[str, Any]:
     """Return the current STM32 hardware status."""
 
     if _HOOKS.hardware_status is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: hardware_status is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: hardware_status is missing")
     return _HOOKS.hardware_status()
 
 
@@ -187,9 +183,7 @@ def _detect_serial_ports() -> list[str]:
     """Detect available serial ports."""
 
     if _HOOKS.detect_serial_ports is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: detect_serial_ports is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: detect_serial_ports is missing")
     return _HOOKS.detect_serial_ports()
 
 
@@ -197,9 +191,7 @@ def _serial_connect(port: Optional[str], baud: Optional[int]) -> dict[str, Any]:
     """Connect a serial port using the injected STM32 callback."""
 
     if _HOOKS.serial_connect is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: serial_connect is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: serial_connect is missing")
     return _HOOKS.serial_connect(port, baud)
 
 
@@ -207,9 +199,7 @@ def _current_chip() -> str:
     """Return the current chip name for Telegram status output."""
 
     if _HOOKS.get_current_chip is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: get_current_chip is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: get_current_chip is missing")
     return _HOOKS.get_current_chip()
 
 
@@ -484,9 +474,7 @@ def _telegram_api_call(
     try:
         data = response.json()
     except ValueError as exc:
-        raise RuntimeError(
-            f"Telegram API 返回非法 JSON: HTTP {response.status_code}"
-        ) from exc
+        raise RuntimeError(f"Telegram API 返回非法 JSON: HTTP {response.status_code}") from exc
 
     if response.status_code >= 400 or not data.get("ok"):
         detail = data.get("description") or response.text[:200] or f"HTTP {response.status_code}"
@@ -1060,9 +1048,7 @@ def configure_telegram_cli() -> dict[str, Any]:
     _console().print()
     _console().print("[green]  ✓ Telegram 配置已保存[/]")
     _console().print(f"  [green]✓[/] Bot       @{saved.get('bot_username') or '-'}")
-    _console().print(
-        f"  [green]✓[/] Token     {_mask_telegram_token(saved.get('bot_token', ''))}"
-    )
+    _console().print(f"  [green]✓[/] Token     {_mask_telegram_token(saved.get('bot_token', ''))}")
     _console().print(
         f"  [green]✓[/] 授权模式  {'允许所有 chat' if saved.get('allow_all_chats') else '白名单'}"
     )
@@ -1083,9 +1069,7 @@ def _ensure_ai_for_telegram() -> bool:
         return True
     _console().print("[yellow]Telegram 机器人要能回复，需要先配置 AI 接口[/]")
     if _HOOKS.configure_ai_cli is None:
-        raise RuntimeError(
-            "Telegram integration is not configured: configure_ai_cli is missing"
-        )
+        raise RuntimeError("Telegram integration is not configured: configure_ai_cli is missing")
     _HOOKS.configure_ai_cli()
     if _is_ai_configured():
         return True
@@ -1310,9 +1294,7 @@ class TelegramBotBridge:
             return
         update_id = int(update.get("update_id", 0))
         preview = normalized.replace("\n", " ").strip()[:80]
-        telegram_log(
-            f"telegram update={update_id} chat={chat_id} user={user_id} text={preview!r}"
-        )
+        telegram_log(f"telegram update={update_id} chat={chat_id} user={user_id} text={preview!r}")
 
         if normalized.startswith("/"):
             if _telegram_is_authorized(config, chat_id, user_id):

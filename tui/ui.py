@@ -250,7 +250,9 @@ def run_doctor(*, cli_text: Callable[[str, str], str]) -> None:
         console.print(f"  [green]✓[/] arm-none-eabi-gcc  [dim]{version}[/]")
     else:
         console.print("  [red]✗[/] arm-none-eabi-gcc  未找到")
-        console.print("    [dim]→ sudo apt install gcc-arm-none-eabi  或  python3 setup.py --auto[/]")
+        console.print(
+            "    [dim]→ sudo apt install gcc-arm-none-eabi  或  python3 setup.py --auto[/]"
+        )
         all_ok = False
 
     hal_dir = WORKSPACE / "hal"

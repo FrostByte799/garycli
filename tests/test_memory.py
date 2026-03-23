@@ -36,8 +36,7 @@ def test_prune_member_content_respects_max_file_chars():
     """Pruned member content should stay within the configured size limit."""
 
     dynamic_entries = [
-        f"### [2026-03-23 12:{index:02d}] 动态经验 {index}\n- {'x' * 320}"
-        for index in range(150)
+        f"### [2026-03-23 12:{index:02d}] 动态经验 {index}\n- {'x' * 320}" for index in range(150)
     ]
     content = memory._default_member_content().rstrip() + "\n\n" + "\n\n".join(dynamic_entries)
 

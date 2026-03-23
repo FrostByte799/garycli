@@ -24,4 +24,3 @@ def get_compiler(chip: str) -> ChipCompiler:
         if compiler_cls.supports(chip):
             return compiler_cls()
     raise ValueError(f"No compiler registered for chip: {chip}")
-

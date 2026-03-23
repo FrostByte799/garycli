@@ -2650,6 +2650,7 @@ bind_tool_implementations(
     }
 )
 
+
 # ─────────────────────────────────────────────────────────────
 # STM32 系统提示词
 # ─────────────────────────────────────────────────────────────
@@ -3243,7 +3244,6 @@ class STM32Agent:
         )
 
 
-
 def _status_snapshot() -> dict[str, Any]:
     """Return the current UI status snapshot for banner/status rendering."""
 
@@ -3255,7 +3255,6 @@ def _status_snapshot() -> dict[str, Any]:
     }
 
 
-
 def _print_runtime_banner() -> None:
     """Render the current runtime banner using the modular TUI UI helpers."""
 
@@ -3265,7 +3264,6 @@ def _print_runtime_banner() -> None:
         theme=THEME,
         **_status_snapshot(),
     )
-
 
 
 def _command_actions() -> dict[str, Callable[..., Any]]:

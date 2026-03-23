@@ -468,9 +468,11 @@ def connect_swd(
         "success": success,
         "bridge": bridge,
         "chip_info": dict(bridge.chip_info),
-        "message": f"硬件已连接: {bridge.chip_info.get('device', target_chip)}"
-        if success
-        else "连接失败，请检查探针 USB 连接和驱动",
+        "message": (
+            f"硬件已连接: {bridge.chip_info.get('device', target_chip)}"
+            if success
+            else "连接失败，请检查探针 USB 连接和驱动"
+        ),
     }
 
 

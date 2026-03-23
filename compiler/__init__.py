@@ -69,9 +69,11 @@ def _refresh_exports() -> None:
 
 def _normalize_chip(chip_name: str | None) -> str:
     """Normalize a chip name while preserving the legacy default fallback."""
-    return _base_module.normalize_chip_name(chip_name) or _base_module.normalize_chip_name(
-        _base_module.DEFAULT_CHIP
-    ) or "STM32F103C8"
+    return (
+        _base_module.normalize_chip_name(chip_name)
+        or _base_module.normalize_chip_name(_base_module.DEFAULT_CHIP)
+        or "STM32F103C8"
+    )
 
 
 def _result_to_dict(result: _base_module.CompileResult) -> dict[str, Any]:
@@ -188,4 +190,3 @@ __all__ = [
     "register",
     "reload_package",
 ]
-
