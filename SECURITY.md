@@ -1,6 +1,6 @@
 # 🔒 Security Policy
 
-[🇨🇳 中文版](SECURITY.md)
+[🇨🇳 中文版](SECURITY_CN.md)
 
 ---
 
