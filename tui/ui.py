@@ -84,6 +84,7 @@ def _print_status_bar(
     chip: str,
     model: str,
     hw_connected: bool,
+    serial_connected: bool,
     tokens: int,
     cli_text: Callable[[str, str], str],
 ) -> None:
@@ -94,7 +95,14 @@ def _print_status_bar(
         if hw_connected
         else cli_text("[dim]○ 未连接[/]", "[dim]○ Disconnected[/]")
     )
-    console.print(f"[dim]{hw}  │  {model}  │  {cli_text('上下文', 'context')}: ~{tokens} tokens[/]")
+    serial = (
+        cli_text("[green]串口已连[/]", "[green]Serial on[/]")
+        if serial_connected
+        else cli_text("[dim]串口未连[/]", "[dim]Serial off[/]")
+    )
+    console.print(
+        f"[dim]{hw}  │  {serial}  │  {model}  │  {cli_text('上下文', 'context')}: ~{tokens} tokens[/]"
+    )
     console.rule(style="dim")
 
 
