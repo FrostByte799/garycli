@@ -21,19 +21,13 @@ AI 前端  ：流式对话 + 函数调用工具链
   python3 stm32_agent.py --chip STM32F407VET6   # 指定芯片
 """
 
-import atexit
-import signal
 import sys, os, json, re, time, shutil, subprocess, threading, shlex
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 import requests
-from stm32_extra_tools import EXTRA_TOOLS_MAP, EXTRA_TOOL_SCHEMAS
 from gary_skills import (
-    init_skills,
     handle_skill_command,
-    SKILL_TOOLS_MAP,
-    SKILL_TOOL_SCHEMAS,
     _get_manager,
 )
 
@@ -59,62 +53,62 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.styles import Style
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 
-from openai import OpenAI
-
 # Flash 项目内部模块
+import ai.client as _ai_client_module
 import config as _cfg
 import compiler as _compiler_module
+from ai.client import (
+    _AI_PRESETS,
+    _ai_is_configured,
+    _api_key_is_placeholder,
+    _mask_key,
+    _read_ai_config,
+    _write_ai_config,
+    _write_cli_language_config,
+    get_ai_client,
+    reload_ai_config,
+    stream_chat,
+)
+from ai.tools import TOOL_SCHEMAS, bind_tool_implementations, dispatch_tool_call
+from core.memory import (
+    _append_member_memory,
+    _ensure_member_file,
+    _member_preview_markdown,
+    _record_success_memory,
+    gary_save_member_memory,
+)
+from core.state import get_context
+from integrations.telegram import (
+    configure_telegram_integration,
+    get_telegram_target_candidates,
+    handle_telegram_command,
+    start_telegram_bot,
+    stop_local_telegram_bridge,
+    stop_telegram_bot,
+    telegram_is_configured,
+    telegram_log,
+)
+from prompts.debug import get_debug_prompt
+from prompts.member import get_member_prompt_section
+from prompts.system import build_system_prompt
 
 Compiler = _compiler_module.Compiler
 
-AI_API_KEY = getattr(_cfg, "AI_API_KEY", "")
-AI_BASE_URL = getattr(_cfg, "AI_BASE_URL", "https://api.openai.com/v1")
-AI_MODEL = getattr(_cfg, "AI_MODEL", "gpt-4o")
-AI_TEMPERATURE = getattr(_cfg, "AI_TEMPERATURE", 1)
+AI_API_KEY = _ai_client_module.AI_API_KEY
+AI_BASE_URL = _ai_client_module.AI_BASE_URL
+AI_MODEL = _ai_client_module.AI_MODEL
+AI_TEMPERATURE = _ai_client_module.AI_TEMPERATURE
 
 WORKSPACE = _cfg.WORKSPACE
 BUILD_DIR = _cfg.BUILD_DIR
 PROJECTS_DIR = _cfg.PROJECTS_DIR
-DEFAULT_CHIP = getattr(_cfg, "DEFAULT_CHIP", "")
-DEFAULT_CLOCK = getattr(_cfg, "DEFAULT_CLOCK", "HSI_internal")
-CLI_LANGUAGE = getattr(_cfg, "CLI_LANGUAGE", "zh")
-SERIAL_PORT = getattr(_cfg, "SERIAL_PORT", "")
-SERIAL_BAUD = getattr(_cfg, "SERIAL_BAUD", 115200)
-POST_FLASH_DELAY = getattr(_cfg, "POST_FLASH_DELAY", 1.5)
-REGISTER_READ_DELAY = getattr(_cfg, "REGISTER_READ_DELAY", 0.3)
-
-# ─────────────────────────────────────────────────────────────
-# AI 接口管理（动态读写 config.py，支持运行时切换）
-# ─────────────────────────────────────────────────────────────
-_AI_PRESETS = [
-    # (显示名,                base_url,                                                    默认 model)
-    ("OpenAI", "https://api.openai.com/v1", "gpt-4o"),
-    ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
-    ("Kimi / Moonshot", "https://api.moonshot.cn/v1", "kimi-k2.5"),
-    (
-        "Google Gemini",
-        "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "gemini-2.0-flash",
-    ),
-    ("通义千问 (阿里云)", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-    ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4/", "glm-4-flash"),
-    ("Ollama (本地)", "http://127.0.0.1:11434/v1", "qwen2.5-coder:14b"),
-    ("自定义 / Other", "", ""),
-]
-
-_CONFIG_KEYS_TO_RELOAD = (
-    "AI_API_KEY",
-    "AI_BASE_URL",
-    "AI_MODEL",
-    "AI_TEMPERATURE",
-    "DEFAULT_CHIP",
-    "DEFAULT_CLOCK",
-    "CLI_LANGUAGE",
-    "SERIAL_PORT",
-    "SERIAL_BAUD",
-    "POST_FLASH_DELAY",
-    "REGISTER_READ_DELAY",
-)
+DEFAULT_CHIP = _ai_client_module.DEFAULT_CHIP
+DEFAULT_CLOCK = _ai_client_module.DEFAULT_CLOCK
+CLI_LANGUAGE = _ai_client_module.CLI_LANGUAGE
+SERIAL_PORT = _ai_client_module.SERIAL_PORT
+SERIAL_BAUD = _ai_client_module.SERIAL_BAUD
+POST_FLASH_DELAY = _ai_client_module.POST_FLASH_DELAY
+REGISTER_READ_DELAY = _ai_client_module.REGISTER_READ_DELAY
 
 
 def _parse_cli_language(value: Any, default: Optional[str] = None) -> Optional[str]:
@@ -133,1521 +127,91 @@ def _normalize_cli_language(value: Any) -> str:
 
 
 CLI_LANGUAGE = _normalize_cli_language(CLI_LANGUAGE)
+get_context().cli_language = CLI_LANGUAGE
 
 
 def _is_cli_english() -> bool:
-    return CLI_LANGUAGE == "en"
+    return get_context().cli_language == "en"
 
 
 def _cli_text(zh: str, en: str) -> str:
     return en if _is_cli_english() else zh
 
 
-def _upsert_config_assignment(text: str, key: str, value: Any) -> str:
-    line = f"{key} = {json.dumps(value, ensure_ascii=False)}"
-    pattern = rf"^{key}\s*=.*$"
-    if re.search(pattern, text, re.MULTILINE):
-        return re.sub(pattern, line, text, flags=re.MULTILINE)
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + line + "\n"
+def _sync_ai_runtime_settings(settings: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """同步 ai.client 重载后的运行时配置到当前模块。"""
 
+    global AI_API_KEY
+    global AI_BASE_URL
+    global AI_MODEL
+    global AI_TEMPERATURE
+    global DEFAULT_CHIP
+    global DEFAULT_CLOCK
+    global CLI_LANGUAGE
+    global SERIAL_PORT
+    global SERIAL_BAUD
+    global POST_FLASH_DELAY
+    global REGISTER_READ_DELAY
 
-def _read_ai_config() -> tuple:
-    """从 config.py 读取 (api_key, base_url, model)"""
-    p = _HERE / "config.py"
-    if not p.exists():
-        return AI_API_KEY, AI_BASE_URL, AI_MODEL
-    text = p.read_text(encoding="utf-8")
-
-    def _get(pat):
-        m = re.search(pat, text, re.MULTILINE)
-        return m.group(1).strip() if m else ""
-
-    return (
-        _get(r'^AI_API_KEY\s*=\s*["\']([^"\']*)["\']') or AI_API_KEY,
-        _get(r'^AI_BASE_URL\s*=\s*["\']([^"\']*)["\']') or AI_BASE_URL,
-        _get(r'^AI_MODEL\s*=\s*["\']([^"\']*)["\']') or AI_MODEL,
-    )
-
-
-def _write_config_assignments(updates: Dict[str, Any]) -> bool:
-    """原地修改 config.py 中的若干配置项"""
-    p = _HERE / "config.py"
-    if not p.exists():
-        return False
-    text = p.read_text(encoding="utf-8")
-    for key, value in updates.items():
-        text = _upsert_config_assignment(text, key, value)
-    p.write_text(text, encoding="utf-8")
-    return True
-
-
-def _write_ai_config(api_key: str, base_url: str, model: str) -> bool:
-    """原地修改 config.py 的三行 AI 配置"""
-    return _write_config_assignments(
-        {
-            "AI_API_KEY": api_key,
-            "AI_BASE_URL": base_url,
-            "AI_MODEL": model,
-        }
-    )
-
-
-def _write_cli_language_config(language: str) -> bool:
-    return _write_config_assignments(
-        {
-            "CLI_LANGUAGE": _normalize_cli_language(language),
-        }
-    )
-
-
-def _reload_ai_globals():
-    """写入 config.py 后重新加载 AI 相关全局变量"""
-    import importlib, config as _cfg
-
-    importlib.reload(_cfg)
-    defaults = {
-        "AI_API_KEY": "",
-        "AI_BASE_URL": "https://api.openai.com/v1",
-        "AI_MODEL": "gpt-4o",
-        "AI_TEMPERATURE": 1,
-        "DEFAULT_CHIP": "",
-        "DEFAULT_CLOCK": "HSI_internal",
-        "CLI_LANGUAGE": "zh",
-        "SERIAL_PORT": "",
-        "SERIAL_BAUD": 115200,
-        "POST_FLASH_DELAY": 1.5,
-        "REGISTER_READ_DELAY": 0.3,
-    }
-    for name in _CONFIG_KEYS_TO_RELOAD:
-        globals()[name] = getattr(_cfg, name, defaults[name])
-    globals()["CLI_LANGUAGE"] = _normalize_cli_language(globals().get("CLI_LANGUAGE", "zh"))
-
-
-def _mask_key(key: str) -> str:
-    if not key:
-        return "(未设置)"
-    return key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
-
-
-def _api_key_is_placeholder(api_key: str) -> bool:
-    key = (api_key or "").strip()
-    if not key:
-        return True
-    placeholder_prefixes = ("YOUR_API_KEY", "sk-YOUR")
-    return any(key.startswith(prefix) for prefix in placeholder_prefixes)
-
-
-def _ai_is_configured() -> bool:
-    api_key, base_url, model = _read_ai_config()
-    return bool(api_key and base_url and model and not _api_key_is_placeholder(api_key))
+    data = settings or reload_ai_config()
+    AI_API_KEY = str(data.get("AI_API_KEY", AI_API_KEY))
+    AI_BASE_URL = str(data.get("AI_BASE_URL", AI_BASE_URL))
+    AI_MODEL = str(data.get("AI_MODEL", AI_MODEL))
+    AI_TEMPERATURE = data.get("AI_TEMPERATURE", AI_TEMPERATURE)
+    DEFAULT_CHIP = str(data.get("DEFAULT_CHIP", DEFAULT_CHIP))
+    DEFAULT_CLOCK = str(data.get("DEFAULT_CLOCK", DEFAULT_CLOCK))
+    CLI_LANGUAGE = _normalize_cli_language(data.get("CLI_LANGUAGE", CLI_LANGUAGE))
+    SERIAL_PORT = str(data.get("SERIAL_PORT", SERIAL_PORT))
+    SERIAL_BAUD = data.get("SERIAL_BAUD", SERIAL_BAUD)
+    POST_FLASH_DELAY = data.get("POST_FLASH_DELAY", POST_FLASH_DELAY)
+    REGISTER_READ_DELAY = data.get("REGISTER_READ_DELAY", REGISTER_READ_DELAY)
+    get_context().cli_language = CLI_LANGUAGE
+    return data
 
 
 # ─────────────────────────────────────────────────────────────
 # Gary member.md 经验库（自动记忆 + 系统提示注入）
 # ─────────────────────────────────────────────────────────────
-MEMBER_MD_PATH = _HERE / "member.md"
-MEMBER_PROMPT_CHAR_LIMIT = 12000
-MEMBER_PROMPT_MAX_DYNAMIC = 24
-MEMBER_MAX_FILE_CHARS = 40000
-MEMBER_MAX_DYNAMIC_ENTRIES = 120
-_MEMBER_LOCK = threading.RLock()
-
-
-def _default_member_content() -> str:
-    return """# Gary Member Memory
-
-## Focus
-- 这里只记录高价值、可复用、能提高成功率的经验。
-- 自动写入：成功编译、成功运行闭环。
-- 主动写入：遇到关键初始化顺序、硬件坑、寄存器判定经验、稳定模板时，调用 `gary_save_member_memory`。
-- 经验必须短、具体、可执行，不要粘贴大段原始日志。
-
-## Memories
-
-### [Pinned] 启动标记优先
-- UART 初始化后立刻打印 `Gary:BOOT`，再初始化 I2C/SPI/TIM/OLED 等外设。
-- 这样即使后续外设卡死，也能先确认程序已启动。
-
-### [Pinned] 裸机 HAL_Delay 依赖 SysTick_Handler
-- 裸机代码必须定义 `void SysTick_Handler(void) { HAL_IncTick(); }`。
-- 否则 `HAL_Delay()` 会永久阻塞。
-
-### [Pinned] I2C 外设先探测再使用
-- 初始化后先 `HAL_I2C_IsDeviceReady()` 检查从设备是否应答。
-- 无应答优先怀疑接线或地址，不要盲改业务逻辑。
-
-### [Pinned] 增量修改优先精确替换
-- 修改已有工程时优先 `str_replace_edit` + `stm32_recompile`。
-- 不要无必要地整文件重写。
-
-### [Pinned] 裸机禁止 sprintf/printf/malloc
-- 裸机项目优先手写轻量调试输出，避免 `_sbrk/end` 链接错误。
-"""
-
-
-def _ensure_member_file() -> Path:
-    with _MEMBER_LOCK:
-        if not MEMBER_MD_PATH.exists():
-            MEMBER_MD_PATH.write_text(_default_member_content(), encoding="utf-8")
-    return MEMBER_MD_PATH
-
-
-def _normalize_member_text(value: Any, limit: int = 220) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip(" -\t\r\n")
-    if len(text) > limit:
-        text = text[: limit - 3].rstrip() + "..."
-    return text
-
-
-def _member_text_to_lines(value: Any, per_line_limit: int = 220, max_lines: int = 8) -> list[str]:
-    source = str(value or "").replace("\r", "\n")
-    lines = []
-    for raw in source.splitlines():
-        line = _normalize_member_text(raw, limit=per_line_limit)
-        if line:
-            lines.append(line)
-        if len(lines) >= max_lines:
-            break
-    if not lines:
-        single = _normalize_member_text(source, limit=per_line_limit)
-        if single:
-            lines.append(single)
-    return lines
-
-
-def _split_member_content(text: str) -> tuple[str, list[str]]:
-    source = (text or "").strip()
-    if not source:
-        source = _default_member_content().strip()
-    if "## Memories" not in source:
-        source = _default_member_content().strip() + "\n\n" + source
-    before, _, after = source.partition("## Memories")
-    header = before.rstrip() + "\n\n## Memories\n"
-    entries = [
-        chunk.strip() for chunk in re.split(r"(?m)(?=^### )", after.strip()) if chunk.strip()
-    ]
-    return header, entries
-
-
-def _prune_member_content(text: str) -> str:
-    header, entries = _split_member_content(text)
-    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
-    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
-    dynamic = dynamic[-MEMBER_MAX_DYNAMIC_ENTRIES:]
-
-    kept = []
-    total = len(header)
-    for entry in pinned:
-        needed = len(entry) + 2
-        if kept and total + needed > MEMBER_MAX_FILE_CHARS:
-            break
-        kept.append(entry)
-        total += needed
-
-    recent = []
-    for entry in reversed(dynamic):
-        needed = len(entry) + 2
-        if recent and total + needed > MEMBER_MAX_FILE_CHARS:
-            break
-        recent.append(entry)
-        total += needed
-    recent.reverse()
-    kept.extend(recent)
-
-    content = header.rstrip() + "\n\n" + "\n\n".join(kept).strip()
-    return content.strip() + "\n"
-
-
-def _append_member_memory(
-    title: str,
-    experience: str,
-    tags: Optional[list[str]] = None,
-    source: str = "manual",
-    importance: str = "high",
-) -> dict:
-    clean_title = _normalize_member_text(title, limit=120)
-    lines = _member_text_to_lines(experience, per_line_limit=220, max_lines=10)
-    if not clean_title or not lines:
-        return {"success": False, "message": "title 或 experience 为空"}
-
-    tags = [
-        _normalize_member_text(tag, limit=24)
-        for tag in (tags or [])
-        if _normalize_member_text(tag, limit=24)
-    ][:10]
-    source = _normalize_member_text(source, limit=40) or "manual"
-    importance = _normalize_member_text(importance, limit=16) or "high"
-
-    fingerprint = _normalize_member_text(clean_title + " " + " ".join(lines), limit=500).lower()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry_lines = [
-        f"### [{timestamp}] {clean_title}",
-        f"- importance: {importance}",
-        f"- source: {source}",
-    ]
-    if tags:
-        entry_lines.append(f"- tags: {', '.join(tags)}")
-    entry_lines.extend(f"- {line}" for line in lines)
-    entry = "\n".join(entry_lines)
-
-    with _MEMBER_LOCK:
-        path = _ensure_member_file()
-        current = path.read_text(encoding="utf-8")
-        normalized_current = re.sub(r"\s+", " ", current).lower()
-        if fingerprint and fingerprint in normalized_current:
-            return {
-                "success": True,
-                "deduplicated": True,
-                "path": str(path),
-                "message": f"member.md 已存在相似经验: {clean_title}",
-            }
-        updated = _prune_member_content(current.rstrip() + "\n\n" + entry + "\n")
-        path.write_text(updated, encoding="utf-8")
-    return {
-        "success": True,
-        "deduplicated": False,
-        "path": str(MEMBER_MD_PATH),
-        "message": f"已写入 member.md: {clean_title}",
-    }
-
-
-def gary_save_member_memory(
-    title: str,
-    experience: str,
-    tags: list = None,
-    importance: str = "high",
-) -> dict:
-    """将高价值经验写入 Gary 的 member.md 经验库。"""
-    return _append_member_memory(
-        title=title,
-        experience=experience,
-        tags=tags or [],
-        source="model",
-        importance=importance,
-    )
-
-
-def _infer_code_tags(code: str) -> list[str]:
-    text = code or ""
-    checks = [
-        (
-            "rtos",
-            any(token in text for token in ("FreeRTOS.h", "xTaskCreate", "vTaskDelay(", "task.h")),
-        ),
-        ("uart", "HAL_UART_" in text or "USART" in text),
-        ("debug_print", "Debug_Print(" in text or "Debug_PrintInt(" in text),
-        ("boot_marker", "Gary:BOOT" in text),
-        ("systick", "SysTick_Handler" in text),
-        ("i2c", "HAL_I2C_" in text or "I2C_HandleTypeDef" in text),
-        ("spi", "HAL_SPI_" in text or "SPI_HandleTypeDef" in text),
-        ("adc", "HAL_ADC_" in text or "ADC_HandleTypeDef" in text),
-        ("pwm", "HAL_TIM_PWM_" in text or "TIM_HandleTypeDef" in text),
-        ("oled", "OLED_" in text),
-        ("sensor_check", "HAL_I2C_IsDeviceReady" in text),
-        ("fault_analysis", "HardFault" in text or "SCB_CFSR" in text),
-    ]
-    tags = [name for name, matched in checks if matched]
-    if "rtos" not in tags:
-        tags.insert(0, "baremetal")
-    return tags[:10]
-
-
-def _derive_success_patterns_from_code(code: str) -> list[str]:
-    text = code or ""
-    patterns = []
-    if "Gary:BOOT" in text and ("MX_USART" in text or "HAL_UART_Init" in text):
-        patterns.append("UART 初始化后会尽早打印 Gary:BOOT，启动链路更容易确认。")
-    if "SysTick_Handler" in text and "FreeRTOS.h" not in text:
-        patterns.append("裸机代码显式定义 SysTick_Handler，HAL_Delay 不会卡死。")
-    if "vApplicationTickHook" in text:
-        patterns.append("FreeRTOS 项目通过 vApplicationTickHook 维持 HAL tick。")
-    if "HAL_I2C_IsDeviceReady" in text:
-        patterns.append("I2C 设备在使用前会先做在线探测。")
-    if "Debug_Print(" in text or "Debug_PrintInt(" in text:
-        patterns.append("代码保留了轻量串口调试输出，便于运行时定位问题。")
-    if "xTaskCreate" in text:
-        patterns.append("当前成功模板已经包含可编译的 FreeRTOS 任务结构。")
-    if "str_replace_edit" in text:
-        patterns.append("此模板来自增量修改链路，适合继续做精准替换。")
-    return patterns[:5]
-
-
-def _record_success_memory(
-    event_type: str,
-    code: str,
-    result: Optional[dict] = None,
-    request: str = "",
-    steps: Optional[list] = None,
-):
-    try:
-        tags = _infer_code_tags(code)
-        chip = _current_chip or DEFAULT_CHIP or "UNKNOWN"
-        mode = "rtos" if "rtos" in tags else "baremetal"
-        short_request = _normalize_member_text(request, limit=60)
-        if event_type == "runtime_success":
-            title = f"运行成功闭环 | {chip} | {mode}"
-            if short_request:
-                title += f" | {short_request}"
-        else:
-            title = f"编译成功模板 | {chip} | {mode}"
-
-        lines = []
-        if short_request:
-            lines.append(f"需求: {short_request}")
-        if result and result.get("bin_size"):
-            lines.append(f"bin_size: {result['bin_size']} B")
-        if tags:
-            lines.append(f"特征: {', '.join(tags[:8])}")
-        if event_type == "runtime_success":
-            lines.append("烧录、启动、串口/寄存器验证通过，无 HardFault、无硬件缺失。")
-            uart_step = next((step for step in (steps or []) if step.get("step") == "uart"), None)
-            reg_step = next(
-                (step for step in (steps or []) if step.get("step") == "registers"), None
-            )
-            if uart_step and uart_step.get("boot_ok"):
-                lines.append("串口已看到 Gary:BOOT，启动链路正常。")
-            if reg_step and reg_step.get("key_regs"):
-                reg_names = list(reg_step["key_regs"].keys())[:6]
-                lines.append(f"运行时已回读关键寄存器: {', '.join(reg_names)}")
-        else:
-            lines.append("当前代码已在本机工具链上成功编译通过。")
-        lines.extend(_derive_success_patterns_from_code(code))
-        _append_member_memory(
-            title=title,
-            experience="\n".join(lines),
-            tags=tags,
-            source=event_type,
-            importance="critical" if event_type == "runtime_success" else "high",
-        )
-    except Exception as e:
-        _telegram_log(f"member auto_save error={str(e)[:160]}")
-
-
-def _member_prompt_section() -> str:
-    with _MEMBER_LOCK:
-        path = _ensure_member_file()
-        current = path.read_text(encoding="utf-8")
-    header, entries = _split_member_content(current)
-    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
-    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
-
-    selected = []
-    total = len(header)
-    for entry in pinned:
-        needed = len(entry) + 2
-        if selected and total + needed > MEMBER_PROMPT_CHAR_LIMIT:
-            break
-        selected.append(entry)
-        total += needed
-
-    recent = []
-    for entry in reversed(dynamic):
-        needed = len(entry) + 2
-        if recent and (
-            total + needed > MEMBER_PROMPT_CHAR_LIMIT or len(recent) >= MEMBER_PROMPT_MAX_DYNAMIC
-        ):
-            break
-        recent.append(entry)
-        total += needed
-    recent.reverse()
-    selected.extend(recent)
-
-    excerpt = header.rstrip()
-    if selected:
-        excerpt += "\n\n" + "\n\n".join(selected)
-    return (
-        "## Gary Member Memory（重点）\n"
-        "以下内容来自 member.md，是 Gary 的长期经验库。优先复用这些成功经验；"
-        "遇到新的高价值经验时，调用 `gary_save_member_memory` 写进去。\n\n"
-        f"{excerpt.strip()}"
-    )
-
-
-def _member_preview_markdown(max_dynamic: int = 10) -> str:
-    with _MEMBER_LOCK:
-        path = _ensure_member_file()
-        current = path.read_text(encoding="utf-8")
-    header, entries = _split_member_content(current)
-    pinned = [entry for entry in entries if entry.startswith("### [Pinned]")]
-    dynamic = [entry for entry in entries if not entry.startswith("### [Pinned]")]
-    selected = pinned + dynamic[-max_dynamic:]
-    path_line = _cli_text("路径", "Path")
-    body = header.rstrip()
-    if selected:
-        body += "\n\n" + "\n\n".join(selected)
-    return f"**{path_line}:** `{path}`\n\n{body.strip()}"
-
-
 # ─────────────────────────────────────────────────────────────
 # Telegram 机器人配置 / 守护进程 / 长轮询
 # ─────────────────────────────────────────────────────────────
 GARY_HOME = Path.home() / ".gary"
-TELEGRAM_CONFIG_PATH = GARY_HOME / "telegram_bot.json"
-TELEGRAM_PID_PATH = GARY_HOME / "telegram_bot.pid"
-TELEGRAM_LOG_PATH = GARY_HOME / "telegram_bot.log"
-TELEGRAM_MESSAGE_LIMIT = 3800
-_TELEGRAM_CONFIG_LOCK = threading.RLock()
 
 
 def _ensure_gary_home():
     GARY_HOME.mkdir(parents=True, exist_ok=True)
 
 
-def _default_telegram_config() -> dict:
-    return {
-        "bot_token": "",
-        "bot_id": None,
-        "bot_username": "",
-        "bot_name": "",
-        "allow_all_chats": False,
-        "allowed_chat_ids": [],
-        "allowed_user_ids": [],
-        "last_update_id": 0,
-        "updated_at": "",
+def _shutdown_cli_runtime(stop_telegram: bool = True) -> dict:
+    """退出 CLI 时统一清理资源。"""
+    results = {
+        "hardware": stm32_disconnect(),
+        "bridge_stopped": False,
+        "telegram": {"success": True, "message": "Telegram 保持运行"},
     }
-
-
-def _unique_int_list(values: Any) -> list[int]:
-    result = []
-    seen = set()
-    for value in values or []:
-        try:
-            num = int(str(value).strip())
-        except (TypeError, ValueError):
-            continue
-        if num in seen:
-            continue
-        seen.add(num)
-        result.append(num)
-    return result
-
-
-def _normalize_telegram_config(config: Optional[dict]) -> dict:
-    merged = _default_telegram_config()
-    if isinstance(config, dict):
-        merged.update(config)
-    merged["allow_all_chats"] = bool(merged.get("allow_all_chats", False))
-    merged["allowed_chat_ids"] = _unique_int_list(merged.get("allowed_chat_ids"))
-    merged["allowed_user_ids"] = _unique_int_list(merged.get("allowed_user_ids"))
     try:
-        merged["last_update_id"] = int(merged.get("last_update_id", 0) or 0)
-    except (TypeError, ValueError):
-        merged["last_update_id"] = 0
-    return merged
-
-
-def _read_telegram_config() -> dict:
-    with _TELEGRAM_CONFIG_LOCK:
-        if not TELEGRAM_CONFIG_PATH.exists():
-            return _default_telegram_config()
-        try:
-            raw = json.loads(TELEGRAM_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return _default_telegram_config()
-        return _normalize_telegram_config(raw)
-
-
-def _write_telegram_config(config: dict) -> dict:
-    with _TELEGRAM_CONFIG_LOCK:
-        _ensure_gary_home()
-        clean = _normalize_telegram_config(config)
-        clean["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        TELEGRAM_CONFIG_PATH.write_text(
-            json.dumps(clean, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return clean
-
-
-def _telegram_is_configured(config: Optional[dict] = None) -> bool:
-    config = config or _read_telegram_config()
-    token = str(config.get("bot_token", "")).strip()
-    placeholders = ("", "YOUR_TELEGRAM_BOT_TOKEN", "123456:ABC")
-    return bool(token and token not in placeholders and ":" in token)
-
-
-def _mask_telegram_token(token: str) -> str:
-    if not token:
-        return "(未设置)"
-    return token[:8] + "..." + token[-6:] if len(token) > 20 else "***"
-
-
-def _split_tokens(raw: str) -> list[str]:
-    return [tok for tok in re.split(r"[\s,]+", raw.strip()) if tok]
-
-
-def _parse_telegram_targets(raw: str) -> dict:
-    parsed = {"chat_ids": [], "user_ids": [], "invalid": []}
-    for token in _split_tokens(raw):
-        kind = "chat"
-        value = token
-        lower = token.lower()
-        if lower.startswith("user:"):
-            kind, value = "user", token.split(":", 1)[1]
-        elif lower.startswith("chat:"):
-            kind, value = "chat", token.split(":", 1)[1]
-        try:
-            num = int(value)
-        except ValueError:
-            parsed["invalid"].append(token)
-            continue
-        if kind == "user":
-            parsed["user_ids"].append(num)
-        else:
-            parsed["chat_ids"].append(num)
-    parsed["chat_ids"] = _unique_int_list(parsed["chat_ids"])
-    parsed["user_ids"] = _unique_int_list(parsed["user_ids"])
-    return parsed
-
-
-def _telegram_set_permissions(
-    *,
-    add_chat_ids: Optional[list[int]] = None,
-    remove_chat_ids: Optional[list[int]] = None,
-    add_user_ids: Optional[list[int]] = None,
-    remove_user_ids: Optional[list[int]] = None,
-    allow_all_chats: Optional[bool] = None,
-) -> dict:
-    config = _read_telegram_config()
-    chats = set(config.get("allowed_chat_ids", []))
-    users = set(config.get("allowed_user_ids", []))
-    chats.update(add_chat_ids or [])
-    users.update(add_user_ids or [])
-    chats.difference_update(remove_chat_ids or [])
-    users.difference_update(remove_user_ids or [])
-    config["allowed_chat_ids"] = sorted(chats)
-    config["allowed_user_ids"] = sorted(users)
-    if allow_all_chats is not None:
-        config["allow_all_chats"] = bool(allow_all_chats)
-    return _write_telegram_config(config)
-
-
-def _read_pid_file() -> Optional[int]:
-    try:
-        return int(TELEGRAM_PID_PATH.read_text(encoding="utf-8").strip())
-    except Exception:
-        return None
-
-
-def _pid_is_alive(pid: Optional[int]) -> bool:
-    if not pid:
-        return False
-    proc_stat = Path(f"/proc/{pid}/stat")
-    if proc_stat.exists():
-        try:
-            stat_text = proc_stat.read_text(encoding="utf-8", errors="ignore")
-            fields = stat_text.split()
-            if len(fields) >= 3 and fields[2] == "Z":
-                return False
-            return True
-        except Exception:
-            pass
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _write_pid_file(pid: int):
-    _ensure_gary_home()
-    TELEGRAM_PID_PATH.write_text(str(pid), encoding="utf-8")
-
-
-def _clear_pid_file(expected_pid: Optional[int] = None):
-    if not TELEGRAM_PID_PATH.exists():
-        return
-    if expected_pid is not None:
-        current = _read_pid_file()
-        if current and current != expected_pid:
-            return
-    try:
-        TELEGRAM_PID_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _telegram_daemon_status() -> dict:
-    pid = _read_pid_file()
-    running = _pid_is_alive(pid)
-    if pid and not running:
-        _clear_pid_file(pid)
-        pid = None
-    return {
-        "running": running,
-        "pid": pid,
-        "log_path": str(TELEGRAM_LOG_PATH),
-    }
-
-
-def _telegram_api_call(
-    token: str, method: str, payload: Optional[dict] = None, timeout: float = 30.0
-):
-    url = f"https://api.telegram.org/bot{token}/{method}"
-    try:
-        response = requests.post(url, json=payload or {}, timeout=timeout)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Telegram API 网络错误: {e}") from e
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        raise RuntimeError(f"Telegram API 返回非法 JSON: HTTP {response.status_code}") from e
-
-    if response.status_code >= 400 or not data.get("ok"):
-        detail = data.get("description") or response.text[:200] or f"HTTP {response.status_code}"
-        raise RuntimeError(f"Telegram API 调用失败: {detail}")
-    return data.get("result")
-
-
-def _telegram_get_me(token: str) -> dict:
-    result = _telegram_api_call(token, "getMe", timeout=15.0)
-    return result if isinstance(result, dict) else {}
-
-
-def _telegram_set_my_commands(token: str):
-    commands = [
-        {"command": "start", "description": "查看 Gary 机器人状态和用法"},
-        {"command": "help", "description": "查看 Telegram 侧命令"},
-        {"command": "clear", "description": "清空当前聊天上下文"},
-        {"command": "status", "description": "查看 Gary 当前硬件状态"},
-        {"command": "connect", "description": "连接探针和串口，可带芯片型号"},
-        {"command": "disconnect", "description": "断开当前硬件连接"},
-        {"command": "chip", "description": "查看或切换芯片型号"},
-        {"command": "projects", "description": "查看最近历史项目"},
-    ]
-    _telegram_api_call(token, "setMyCommands", {"commands": commands}, timeout=20.0)
-
-
-def _telegram_split_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    source = (text or "").strip() or "Gary 已处理，但没有返回文本。"
-    chunks = []
-    while len(source) > limit:
-        cut = source.rfind("\n\n", 0, limit)
-        if cut < limit // 3:
-            cut = source.rfind("\n", 0, limit)
-        if cut < limit // 3:
-            cut = source.rfind(" ", 0, limit)
-        if cut < limit // 3:
-            cut = limit
-        chunks.append(source[:cut].rstrip())
-        source = source[cut:].lstrip()
-    if source:
-        chunks.append(source)
-    return chunks
-
-
-def _telegram_send_text(
-    token: str, chat_id: int, text: str, reply_to_message_id: Optional[int] = None
-):
-    for index, chunk in enumerate(_telegram_split_text(text)):
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "disable_web_page_preview": True,
-        }
-        if index == 0 and reply_to_message_id is not None:
-            payload["reply_to_message_id"] = reply_to_message_id
-        _telegram_api_call(token, "sendMessage", payload, timeout=20.0)
-
-
-def _telegram_log(message: str):
-    try:
-        _ensure_gary_home()
-        with TELEGRAM_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
-    except Exception:
-        pass
-
-
-def _telegram_send_chat_action(token: str, chat_id: int, action: str = "typing"):
-    _telegram_api_call(
-        token,
-        "sendChatAction",
-        {"chat_id": chat_id, "action": action},
-        timeout=10.0,
-    )
-
-
-class _TelegramTypingPulse:
-    def __init__(self, token: str, chat_id: int, interval: float = 4.0):
-        self.token = token
-        self.chat_id = chat_id
-        self.interval = interval
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.stop()
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"TelegramTypingPulse:{self.chat_id}",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._thread = None
-
-    def _run(self):
-        while not self._stop_event.is_set():
-            try:
-                _telegram_send_chat_action(self.token, self.chat_id, action="typing")
-            except Exception:
-                pass
-            if self._stop_event.wait(self.interval):
-                break
-
-
-class _TelegramPhaseReporter:
-    def __init__(
-        self,
-        token: str,
-        chat_id: int,
-        reply_to_message_id: Optional[int] = None,
-        idle_notice_delay: float = 60.0,
-        heartbeat_interval: float = 60.0,
-    ):
-        self.token = token
-        self.chat_id = chat_id
-        self.reply_to_message_id = reply_to_message_id
-        self.idle_notice_delay = idle_notice_delay
-        self.heartbeat_interval = heartbeat_interval
-        self.preface_text = ""
-        self.preface_sent = False
-        self._idle_notice_sent = False
-        self._last_tool_notice = ""
-        self._last_tool_notice_ts = 0.0
-        self._current_stage = "分析需求"
-        self._last_progress_ts = time.time()
-        self._stop_event = threading.Event()
-        self._progress_thread: Optional[threading.Thread] = None
-
-    def start(self):
-        if self._progress_thread and self._progress_thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._progress_thread = threading.Thread(
-            target=self._progress_loop,
-            name=f"TelegramProgress:{self.chat_id}",
-            daemon=True,
-        )
-        self._progress_thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._progress_thread and self._progress_thread.is_alive():
-            self._progress_thread.join(timeout=0.5)
-        self._progress_thread = None
-
-    def capture_preface(self, text: str):
-        cleaned = (text or "").strip()
-        if cleaned:
-            self.preface_text = cleaned
-
-    def send_preface_if_needed(self):
-        if self.preface_sent or not self.preface_text:
-            return
-        try:
-            _telegram_send_text(
-                self.token,
-                self.chat_id,
-                self.preface_text,
-                reply_to_message_id=self.reply_to_message_id,
-            )
-            self.preface_sent = True
-            self._note_progress("前置说明")
-            _telegram_log(f"telegram preface chat={self.chat_id} len={len(self.preface_text)}")
-        except Exception:
-            pass
-
-    def tool_start(self, name: str):
-        self.send_preface_if_needed()
-        tool_name = (name or "").strip() or "unknown"
-        now = time.time()
-        if tool_name == self._last_tool_notice and now - self._last_tool_notice_ts < 1.5:
-            return
-        self._last_tool_notice = tool_name
-        self._last_tool_notice_ts = now
-        self._current_stage = f"执行工具 {tool_name}"
-        try:
-            _telegram_send_text(
-                self.token,
-                self.chat_id,
-                f"🔧 正在调用工具: {tool_name}",
-                reply_to_message_id=self.reply_to_message_id,
-            )
-            self._note_progress(self._current_stage)
-            _telegram_log(f"telegram tool_start chat={self.chat_id} name={tool_name}")
-        except Exception:
-            pass
-
-    def tool_finish(self, name: str, preview: str = ""):
-        tool_name = (name or "").strip() or "unknown"
-        self._current_stage = f"等待下一步 ({tool_name} 已完成)"
-        text = f"✅ 工具完成: {tool_name}"
-        snippet = (preview or "").strip()
-        if snippet:
-            snippet = snippet[:100]
-            text += f"\n{snippet}"
-        try:
-            _telegram_send_text(
-                self.token,
-                self.chat_id,
-                text,
-                reply_to_message_id=self.reply_to_message_id,
-            )
-            self._note_progress(self._current_stage)
-            _telegram_log(f"telegram tool_finish chat={self.chat_id} name={tool_name}")
-        except Exception:
-            pass
-
-    def tool_error(self, name: str, error: str):
-        self.send_preface_if_needed()
-        self._current_stage = f"工具失败 {(name or '').strip() or 'unknown'}"
-        try:
-            detail = (error or "").strip()
-            if len(detail) > 160:
-                detail = detail[:157] + "..."
-            _telegram_send_text(
-                self.token,
-                self.chat_id,
-                f"❌ 工具失败: {(name or '').strip() or 'unknown'}\n{detail or '未知错误'}",
-                reply_to_message_id=self.reply_to_message_id,
-            )
-            self._note_progress(self._current_stage)
-            _telegram_log(
-                f"telegram tool_error chat={self.chat_id} name={(name or '').strip() or 'unknown'} detail={detail[:80]}"
-            )
-        except Exception:
-            pass
-
-    def strip_preface_from_reply(self, reply: str) -> str:
-        cleaned_reply = (reply or "").strip()
-        preface = self.preface_text.strip()
-        if not self.preface_sent or not preface or not cleaned_reply:
-            return cleaned_reply
-        if cleaned_reply == preface:
-            return ""
-        prefix = preface + "\n\n"
-        if cleaned_reply.startswith(prefix):
-            return cleaned_reply[len(prefix) :].lstrip()
-        return cleaned_reply
-
-    def _note_progress(self, stage: str):
-        self._current_stage = stage
-        self._last_progress_ts = time.time()
-
-    def _progress_loop(self):
-        while not self._stop_event.wait(1.0):
-            now = time.time()
-            if (
-                not self._idle_notice_sent
-                and not self.preface_sent
-                and not self._last_tool_notice
-                and now - self._last_progress_ts >= self.idle_notice_delay
-            ):
-                try:
-                    _telegram_send_text(
-                        self.token,
-                        self.chat_id,
-                        "Gary 正在分析需求，准备开始处理。",
-                        reply_to_message_id=self.reply_to_message_id,
-                    )
-                    self._idle_notice_sent = True
-                    self._note_progress("分析需求")
-                    _telegram_log(f"telegram idle_notice chat={self.chat_id}")
-                except Exception:
-                    pass
-                continue
-
-            if now - self._last_progress_ts < self.heartbeat_interval:
-                continue
-
-            stage = self._current_stage or "处理中"
-            try:
-                _telegram_send_text(
-                    self.token,
-                    self.chat_id,
-                    f"⏳ Gary 仍在处理: {stage}",
-                    reply_to_message_id=self.reply_to_message_id,
-                )
-                self._note_progress(stage)
-                _telegram_log(f"telegram heartbeat chat={self.chat_id} stage={stage}")
-            except Exception:
-                pass
-
-
-def _telegram_is_authorized(config: dict, chat_id: int, user_id: int) -> bool:
-    if config.get("allow_all_chats"):
-        return True
-    if chat_id in set(config.get("allowed_chat_ids", [])):
-        return True
-    if user_id in set(config.get("allowed_user_ids", [])):
-        return True
-    return False
-
-
-def _telegram_unauthorized_text(chat_id: int, user_id: int) -> str:
-    return (
-        "这个 Telegram 会话还没授权。\n\n"
-        f"chat_id = {chat_id}\n"
-        f"user_id = {user_id}\n\n"
-        "请在终端执行任一命令后再试：\n"
-        f"gary telegram allow {chat_id}\n"
-        f"gary telegram allow user:{user_id}"
-    )
-
-
-def _telegram_status_lines(include_commands: bool = True) -> list[str]:
-    config = _read_telegram_config()
-    daemon = _telegram_daemon_status()
-    lines = [
-        "Telegram 机器人状态",
-        f"AI 接口: {'已配置' if _ai_is_configured() else '未配置'}",
-        f"机器人: {'已配置' if _telegram_is_configured(config) else '未配置'}",
-        f"Token: {_mask_telegram_token(config.get('bot_token', ''))}",
-        f"Bot: @{config.get('bot_username') or '-'}",
-        f"Bot 名称: {config.get('bot_name') or '-'}",
-        f"授权模式: {'允许所有 chat' if config.get('allow_all_chats') else '白名单'}",
-        f"允许的 chat_id: {config.get('allowed_chat_ids') or '[]'}",
-        f"允许的 user_id: {config.get('allowed_user_ids') or '[]'}",
-        f"守护进程: {'运行中' if daemon['running'] else '未运行'}",
-        f"PID: {daemon.get('pid') or '-'}",
-        f"日志: {daemon['log_path']}",
-        f"last_update_id: {config.get('last_update_id', 0)}",
-    ]
-    if include_commands:
-        lines.extend(
-            [
-                "",
-                "常用命令:",
-                "gary telegram start        启动后台机器人",
-                "gary telegram stop         停止后台机器人",
-                "gary telegram allow <id>   添加 chat_id 白名单",
-                "gary telegram allow user:<id>   添加 user_id 白名单",
-                "gary telegram remove <id>  删除白名单",
-                "gary telegram allow-all    允许所有 chat",
-                "gary telegram whitelist    切回白名单模式",
-                "gary telegram reset        删除 Telegram 配置并停止机器人",
-            ]
-        )
-    return lines
-
-
-def _print_telegram_status(include_commands: bool = True):
-    CONSOLE.print("\n".join(_telegram_status_lines(include_commands=include_commands)))
-    CONSOLE.print()
-
-
-def _telegram_help_text() -> str:
-    return "\n".join(
-        [
-            "Telegram 侧可用命令：",
-            "/start  查看状态和授权信息",
-            "/help   查看帮助",
-            "/clear  清空当前聊天上下文",
-            "/status 查看 Gary 当前硬件状态",
-            "/connect [芯片] 连接探针和串口",
-            "/disconnect 断开硬件",
-            "/chip [型号] 查看或切换芯片",
-            "/projects 查看最近历史项目",
-            "",
-            "其他普通文本会直接发给 Gary，保持当前聊天上下文连续对话。",
-        ]
-    )
-
-
-def _format_hw_status_for_text(status: dict) -> str:
-    return "\n".join(
-        [
-            "Gary 当前状态",
-            f"chip: {status.get('chip', '-')}",
-            f"hw_connected: {status.get('hw_connected', False)}",
-            f"serial_connected: {status.get('serial_connected', False)}",
-            f"gcc_ok: {status.get('gcc_ok', False)}",
-            f"gcc_version: {status.get('gcc_version', '-')}",
-            f"hal_ok: {status.get('hal_ok', False)}",
-            f"hal_lib_ok: {status.get('hal_lib_ok', False)}",
-            f"workspace: {status.get('workspace', '-')}",
-        ]
-    )
-
-
-def _format_projects_for_text(projects: list[dict]) -> str:
-    if not projects:
-        return "暂无历史项目"
-    lines = ["最近项目："]
-    for item in projects[:10]:
-        lines.append(
-            f"- {item.get('name', '-')}"
-            f" | {item.get('chip', '-')}"
-            f" | {str(item.get('request', ''))[:40]}"
-        )
-    return "\n".join(lines)
-
-
-def _normalize_telegram_incoming_text(text: str, bot_username: str) -> Optional[str]:
-    stripped = (text or "").strip()
-    if not stripped.startswith("/"):
-        return stripped
-    head, sep, tail = stripped.partition(" ")
-    command = head
-    if "@" in head:
-        base, mention = head.split("@", 1)
-        if bot_username and mention.lower() != bot_username.lower():
-            return None
-        command = base
-    return f"{command}{sep}{tail}".strip()
-
-
-def configure_telegram_cli() -> dict:
-    CONSOLE.print()
-    CONSOLE.rule("[bold cyan]  配置 Telegram 机器人[/]")
-    CONSOLE.print()
-
-    config = _read_telegram_config()
-    if _telegram_is_configured(config):
-        CONSOLE.print(f"  [dim]当前 Token:[/] {_mask_telegram_token(config.get('bot_token', ''))}")
-        CONSOLE.print(f"  [dim]当前 Bot  :[/] @{config.get('bot_username') or '-'}")
-        CONSOLE.print(
-            f"  [dim]授权模式 :[/] {'允许所有 chat' if config.get('allow_all_chats') else '白名单'}"
-        )
-        CONSOLE.print(f"  [dim]chat_id   :[/] {config.get('allowed_chat_ids') or '[]'}")
-        CONSOLE.print(f"  [dim]user_id   :[/] {config.get('allowed_user_ids') or '[]'}")
-        CONSOLE.print()
-
-    token = ""
-    current_token = str(config.get("bot_token", "")).strip()
-    while True:
-        try:
-            prompt = "  Bot Token"
-            if current_token:
-                prompt += "（回车保留当前）"
-            prompt += ": "
-            entered = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            CONSOLE.print("\n[dim]已取消[/]")
-            return {"success": False, "message": "已取消"}
-
-        token = entered or current_token
-        if not token:
-            CONSOLE.print("[yellow]  Bot Token 不能为空[/]")
-            continue
-        try:
-            me = _telegram_get_me(token)
-            config["bot_token"] = token
-            config["bot_id"] = me.get("id")
-            config["bot_username"] = me.get("username", "")
-            config["bot_name"] = me.get("first_name", "")
-            CONSOLE.print(f"[green]  ✓ Token 有效，机器人: @{config['bot_username']}[/]")
-            break
-        except Exception as e:
-            CONSOLE.print(f"[red]  ✗ Token 校验失败: {e}[/]")
-
-    CONSOLE.print()
-    CONSOLE.print("[bold cyan]  授权模式[/]")
-    CONSOLE.print("    [yellow]1[/]. 白名单（推荐）")
-    CONSOLE.print("    [yellow]2[/]. 允许所有 chat")
-    CONSOLE.print()
-
-    default_choice = "2" if config.get("allow_all_chats") else "1"
-    try:
-        choice = input(f"  输入序号 [1-2]（默认 {default_choice}）: ").strip() or default_choice
-    except (EOFError, KeyboardInterrupt):
-        choice = default_choice
-
-    config["allow_all_chats"] = choice == "2"
-
-    if not config["allow_all_chats"]:
-        try:
-            raw_targets = input(
-                "  输入白名单（chat_id 或 user:123，多项用空格/逗号分隔，回车保留当前）: "
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            raw_targets = ""
-        if raw_targets:
-            parsed = _parse_telegram_targets(raw_targets)
-            if parsed["invalid"]:
-                CONSOLE.print(f"[yellow]  忽略非法项: {parsed['invalid']}[/]")
-            config["allowed_chat_ids"] = parsed["chat_ids"]
-            config["allowed_user_ids"] = parsed["user_ids"]
-
-    saved = _write_telegram_config(config)
-    try:
-        _telegram_set_my_commands(saved["bot_token"])
+        stop_local_telegram_bridge()
+        results["bridge_stopped"] = True
     except Exception as e:
-        CONSOLE.print(f"[yellow]  命令菜单注册失败，可忽略: {e}[/]")
-
-    CONSOLE.print()
-    CONSOLE.print("[green]  ✓ Telegram 配置已保存[/]")
-    CONSOLE.print(f"  [green]✓[/] Bot       @{saved.get('bot_username') or '-'}")
-    CONSOLE.print(f"  [green]✓[/] Token     {_mask_telegram_token(saved.get('bot_token', ''))}")
-    CONSOLE.print(
-        f"  [green]✓[/] 授权模式  {'允许所有 chat' if saved.get('allow_all_chats') else '白名单'}"
-    )
-    if not saved.get("allow_all_chats"):
-        CONSOLE.print(f"  [green]✓[/] chat_id   {saved.get('allowed_chat_ids') or '[]'}")
-        CONSOLE.print(f"  [green]✓[/] user_id   {saved.get('allowed_user_ids') or '[]'}")
-        CONSOLE.print(
-            "  [dim]若还不知道 chat_id，可先在 Telegram 给机器人发 /start，再按提示执行 allow 命令[/]"
-        )
-    CONSOLE.print()
-    return {"success": True, "config": saved}
-
-
-def _ensure_ai_for_telegram() -> bool:
-    if _ai_is_configured():
-        return True
-    CONSOLE.print("[yellow]Telegram 机器人要能回复，需要先配置 AI 接口[/]")
-    configure_ai_cli()
-    if _ai_is_configured():
-        return True
-    CONSOLE.print("[red]AI 接口仍未配置，无法启动 Telegram 机器人[/]")
-    return False
-
-
-def _start_telegram_daemon() -> dict:
-    daemon = _telegram_daemon_status()
-    if daemon["running"]:
-        return {"success": True, "message": f"Telegram 机器人已在后台运行（PID {daemon['pid']}）"}
-
-    config = _read_telegram_config()
-    if not _telegram_is_configured(config):
-        return {
-            "success": False,
-            "message": "Telegram 机器人尚未配置，请先运行 gary telegram 或 /telegram",
-        }
-    if not _ai_is_configured():
-        return {"success": False, "message": "AI 接口未配置，先运行 gary config 或 /config"}
-
-    _ensure_gary_home()
-    log_handle = TELEGRAM_LOG_PATH.open("a", encoding="utf-8")
-    log_handle.write(
-        f"\n[{datetime.now().isoformat(timespec='seconds')}] starting telegram daemon\n"
-    )
-    log_handle.flush()
-    try:
-        process = subprocess.Popen(
-            [sys.executable, str(_HERE / "stm32_agent.py"), "telegram", "serve", "--daemonized"],
-            cwd=str(_HERE),
-            stdout=log_handle,
-            stderr=log_handle,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    finally:
-        log_handle.close()
-
-    time.sleep(1.2)
-    if _pid_is_alive(process.pid):
-        return {
-            "success": True,
-            "message": f"Telegram 机器人已启动（PID {process.pid}）",
-            "pid": process.pid,
-        }
-    return {"success": False, "message": f"后台启动失败，请查看日志: {TELEGRAM_LOG_PATH}"}
-
-
-def _stop_telegram_daemon() -> dict:
-    daemon = _telegram_daemon_status()
-    pid = daemon.get("pid")
-    if not daemon["running"] or not pid:
-        return {"success": True, "message": "Telegram 机器人当前未运行"}
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        _clear_pid_file(pid)
-        return {"success": False, "message": f"停止失败: {e}"}
-
-    for _ in range(20):
-        if not _pid_is_alive(pid):
-            _clear_pid_file(pid)
-            return {"success": True, "message": f"Telegram 机器人已停止（PID {pid}）"}
-        time.sleep(0.2)
-
-    return {"success": False, "message": f"停止超时，请手动检查 PID {pid}"}
-
-
-def _reset_telegram_config() -> dict:
-    _stop_telegram_daemon()
-    if TELEGRAM_CONFIG_PATH.exists():
-        TELEGRAM_CONFIG_PATH.unlink()
-    return {"success": True, "message": f"已删除 Telegram 配置: {TELEGRAM_CONFIG_PATH}"}
-
-
-class TelegramBotBridge:
-    def __init__(self):
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._chat_agents: Dict[int, "STM32Agent"] = {}
-        self._last_error = ""
-        self._started_at: Optional[float] = None
-
-    def is_running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def start(self) -> dict:
-        config = _read_telegram_config()
-        if not _telegram_is_configured(config):
-            return {"success": False, "message": "Telegram 机器人未配置"}
-        if not _ai_is_configured():
-            return {"success": False, "message": "AI 接口未配置"}
-        if self.is_running():
-            return {"success": True, "message": "Telegram 机器人已在当前进程运行"}
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._poll_loop, name="GaryTelegramBridge", daemon=True
-        )
-        self._thread.start()
-        self._started_at = time.time()
-        return {"success": True, "message": "Telegram 机器人已启动"}
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
-        self._thread = None
-
-    def status(self) -> dict:
-        return {
-            "running": self.is_running(),
-            "started_at": self._started_at,
-            "last_error": self._last_error,
-            "chat_sessions": len(self._chat_agents),
-        }
-
-    def _get_agent(self, chat_id: int) -> "STM32Agent":
-        agent = self._chat_agents.get(chat_id)
-        if agent is None:
-            agent = STM32Agent(interactive=False)
-            self._chat_agents[chat_id] = agent
-        agent.refresh_ai_client()
-        return agent
-
-    def _reset_chat(self, chat_id: int):
-        self._chat_agents.pop(chat_id, None)
-
-    def _poll_loop(self):
-        while not self._stop_event.is_set():
-            config = _read_telegram_config()
-            token = str(config.get("bot_token", "")).strip()
-            if not token:
-                self._last_error = "Telegram Token 为空"
-                time.sleep(2.0)
-                continue
-
-            latest_seen = int(config.get("last_update_id", 0))
-            try:
-                updates = (
-                    _telegram_api_call(
-                        token,
-                        "getUpdates",
-                        {
-                            "offset": latest_seen + 1,
-                            "timeout": 25,
-                            "allowed_updates": ["message"],
-                        },
-                        timeout=35.0,
-                    )
-                    or []
-                )
-                self._last_error = ""
-            except Exception as e:
-                self._last_error = str(e)
-                time.sleep(2.0)
-                continue
-
-            for update in updates:
-                latest_seen = max(latest_seen, int(update.get("update_id", 0)))
-                try:
-                    self._handle_update(update)
-                except Exception as e:
-                    self._last_error = str(e)
-                    CONSOLE.print(f"[red]Telegram 处理失败: {e}[/]")
-
-            if latest_seen > int(config.get("last_update_id", 0)):
-                config["last_update_id"] = latest_seen
-                _write_telegram_config(config)
-
-    def _handle_update(self, update: dict):
-        message = update.get("message")
-        if not message:
-            return
-
-        chat = message.get("chat") or {}
-        from_user = message.get("from") or {}
-        text = message.get("text", "")
-        if not text:
-            return
-
-        config = _read_telegram_config()
-        token = config["bot_token"]
-        chat_id = int(chat.get("id"))
-        user_id = int(from_user.get("id", 0))
-        message_id = message.get("message_id")
-        normalized = _normalize_telegram_incoming_text(text, str(config.get("bot_username", "")))
-        if normalized is None:
-            return
-        update_id = int(update.get("update_id", 0))
-        preview = normalized.replace("\n", " ").strip()[:80]
-        _telegram_log(f"telegram update={update_id} chat={chat_id} user={user_id} text={preview!r}")
-
-        reply = None
-        if normalized.startswith("/"):
-            if _telegram_is_authorized(config, chat_id, user_id):
-                with _TelegramTypingPulse(token, chat_id):
-                    handled, reply = self._handle_command(normalized, config, chat_id, user_id)
-                    if handled:
-                        if reply:
-                            _telegram_send_text(
-                                token, chat_id, reply, reply_to_message_id=message_id
-                            )
-                        return
-            else:
-                handled, reply = self._handle_command(normalized, config, chat_id, user_id)
-                if handled:
-                    if reply:
-                        _telegram_send_text(token, chat_id, reply, reply_to_message_id=message_id)
-                    return
-
-        if not _telegram_is_authorized(config, chat_id, user_id):
-            _telegram_log(f"telegram unauthorized chat={chat_id} user={user_id}")
-            _telegram_send_text(
-                token,
-                chat_id,
-                _telegram_unauthorized_text(chat_id, user_id),
-                reply_to_message_id=message_id,
-            )
-            return
-
-        agent = self._get_agent(chat_id)
-        reporter = _TelegramPhaseReporter(token, chat_id, reply_to_message_id=message_id)
-
-        def _on_text(preview_text: str):
-            reporter.capture_preface(preview_text)
-
-        def _on_tool(event: dict):
-            phase = event.get("phase")
-            name = event.get("name", "")
-            if phase == "start":
-                reporter.tool_start(name)
-            elif phase == "finish":
-                reporter.tool_finish(name, event.get("preview", ""))
-            elif phase == "error":
-                reporter.tool_error(name, event.get("error", ""))
-
-        with _TelegramTypingPulse(token, chat_id):
-            reporter.start()
-            started_at = time.time()
-            try:
-                reply = agent.chat(
-                    normalized,
-                    stream_to_console=False,
-                    text_callback=_on_text,
-                    tool_callback=_on_tool,
-                ).strip()
-            finally:
-                reporter.stop()
-            reply = reporter.strip_preface_from_reply(reply)
-            if not reply:
-                _telegram_log(
-                    f"telegram empty_final chat={chat_id} preface_sent={reporter.preface_sent} preface_len={len(reporter.preface_text)}"
-                )
-                reply = "工具已执行，但 AI 没有返回最终正文。请重试一次；若仍复现，我会继续排查。"
-            _telegram_send_text(token, chat_id, reply, reply_to_message_id=message_id)
-            _telegram_log(
-                f"telegram reply chat={chat_id} elapsed={time.time() - started_at:.1f}s len={len(reply)}"
-            )
-
-    def _handle_command(
-        self, command_text: str, config: dict, chat_id: int, user_id: int
-    ) -> tuple[bool, str]:
-        parts = command_text.split(None, 1)
-        head = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        authorized = _telegram_is_authorized(config, chat_id, user_id)
-
-        if head in ("/start", "/help"):
-            if authorized:
-                return True, _telegram_help_text()
-            return True, _telegram_unauthorized_text(chat_id, user_id) + "\n\n发送授权后再试。"
-
-        if not authorized:
-            return True, _telegram_unauthorized_text(chat_id, user_id)
-
-        if head in ("/clear", "/new"):
-            self._reset_chat(chat_id)
-            return True, "当前 Telegram 会话上下文已清空。"
-
-        if head == "/status":
-            return True, _format_hw_status_for_text(stm32_hardware_status())
-
-        if head == "/connect":
-            result = stm32_connect(arg or None)
-            return True, result.get("message", json.dumps(result, ensure_ascii=False))
-
-        if head == "/disconnect":
-            result = stm32_disconnect()
-            return True, result.get("message", json.dumps(result, ensure_ascii=False))
-
-        if head == "/chip":
-            if not arg:
-                return True, f"当前芯片: {_current_chip or '(未设置)'}"
-            result = stm32_set_chip(arg)
-            return True, f"已切换芯片: {result.get('chip')} ({result.get('family')})"
-
-        if head == "/projects":
-            result = stm32_list_projects()
-            return True, _format_projects_for_text(result.get("projects", []))
-
-        if head == "/serial":
-            tokens = arg.split()
-            if tokens and tokens[0] == "list":
-                ports = detect_serial_ports()
-                return True, "可用串口: " + (", ".join(ports) if ports else "无")
-            port = tokens[0] if tokens and tokens[0].startswith("/dev/") else None
-            baud = None
-            for token in tokens:
-                if token.isdigit():
-                    baud = int(token)
-                    break
-            result = stm32_serial_connect(port, baud)
-            return True, result.get("message", json.dumps(result, ensure_ascii=False))
-
-        if head == "/telegram":
-            return True, "\n".join(_telegram_status_lines(include_commands=False))
-
-        return False, ""
-
-
-_telegram_bridge = TelegramBotBridge()
-_telegram_cli_autostart_done = False
+        results["bridge_stopped"] = False
+        results["bridge_error"] = str(e)
+    if stop_telegram:
+        try:
+            results["telegram"] = stop_telegram_bot()
+        except Exception as e:
+            results["telegram"] = {"success": False, "message": f"停止 Telegram 机器人失败: {e}"}
+    return results
 
 
 def _ensure_cli_telegram_daemon() -> Optional[dict]:
-    global _telegram_cli_autostart_done
-    if _telegram_cli_autostart_done:
-        return None
-    _telegram_cli_autostart_done = True
+    """在 CLI 启动时按配置自动拉起 Telegram 后台机器人。"""
 
-    configured = _telegram_is_configured()
+    ctx = get_context()
+    if ctx.telegram_cli_autostart_done:
+        return None
+    ctx.telegram_cli_autostart_done = True
+
+    configured = telegram_is_configured()
     ai_ready = _ai_is_configured()
     if not configured and not ai_ready:
         return None
@@ -1662,288 +226,11 @@ def _ensure_cli_telegram_daemon() -> Optional[dict]:
     if not configured:
         return None
 
-    daemon = _telegram_daemon_status()
-    if daemon["running"]:
-        return {
-            "success": True,
-            "message": f"{_cli_text('已在后台运行', 'already running in background')} (PID {daemon.get('pid')})",
-        }
-
-    result = _start_telegram_daemon()
+    result = start_telegram_bot()
     return {
         "success": bool(result.get("success")),
         "message": str(result.get("message", "")).strip(),
     }
-
-
-def serve_telegram_forever(daemonized: bool = False) -> int:
-    if not _telegram_is_configured():
-        CONSOLE.print("[red]Telegram 机器人未配置[/]")
-        return 1
-    if not _ai_is_configured():
-        CONSOLE.print("[red]AI 接口未配置，无法启动 Telegram 机器人[/]")
-        return 1
-
-    result = _telegram_bridge.start()
-    if not result["success"]:
-        CONSOLE.print(f"[red]{result['message']}[/]")
-        return 1
-
-    if daemonized:
-        _write_pid_file(os.getpid())
-        atexit.register(lambda: _clear_pid_file(os.getpid()))
-
-    CONSOLE.print("[green]Telegram 机器人正在运行，Ctrl+C 停止[/]")
-    try:
-        while _telegram_bridge.is_running():
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        CONSOLE.print("\n[yellow]收到停止信号，正在退出 Telegram 机器人...[/]")
-    finally:
-        _telegram_bridge.stop()
-        if daemonized:
-            _clear_pid_file(os.getpid())
-    return 0
-
-
-def _interactive_telegram_menu() -> bool:
-    CONSOLE.print()
-    CONSOLE.rule("[bold cyan]  Telegram 管理[/]")
-    CONSOLE.print()
-    _print_telegram_status(include_commands=False)
-    CONSOLE.print("[bold cyan]  可执行操作：[/]")
-    CONSOLE.print("    [yellow]1[/]. 查看状态")
-    CONSOLE.print("    [yellow]2[/]. 重新配置机器人")
-    CONSOLE.print("    [yellow]3[/]. 启动后台机器人")
-    CONSOLE.print("    [yellow]4[/]. 停止后台机器人")
-    CONSOLE.print("    [yellow]5[/]. 添加白名单")
-    CONSOLE.print("    [yellow]6[/]. 删除白名单")
-    CONSOLE.print("    [yellow]7[/]. 允许所有 chat")
-    CONSOLE.print("    [yellow]8[/]. 切回白名单模式")
-    CONSOLE.print("    [yellow]9[/]. 重置 Telegram 配置")
-    CONSOLE.print()
-
-    try:
-        choice = input("  输入序号（回车取消）: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        CONSOLE.print("\n[dim]已取消[/]\n")
-        return True
-
-    if not choice:
-        CONSOLE.print("[dim]已取消[/]\n")
-        return True
-
-    if choice == "1":
-        _print_telegram_status(include_commands=True)
-        return True
-
-    if choice == "2":
-        if not _ensure_ai_for_telegram():
-            return True
-        result = configure_telegram_cli()
-        if result.get("success"):
-            daemon = _telegram_daemon_status()
-            if daemon["running"]:
-                stop_result = _stop_telegram_daemon()
-                start_result = _start_telegram_daemon()
-                CONSOLE.print(
-                    f"[{'green' if stop_result['success'] else 'red'}]{stop_result['message']}[/]"
-                )
-                CONSOLE.print(
-                    f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]"
-                )
-                CONSOLE.print()
-        return True
-
-    if choice == "3":
-        return handle_telegram_command("start", source="builtin")
-
-    if choice == "4":
-        return handle_telegram_command("stop", source="builtin")
-
-    if choice in ("5", "6"):
-        action = "allow" if choice == "5" else "remove"
-        label = "添加" if choice == "5" else "删除"
-        try:
-            raw = input(f"  输入要{label}的 chat_id 或 user:123（可多个，空格分隔）: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            CONSOLE.print("\n[dim]已取消[/]\n")
-            return True
-        if not raw:
-            CONSOLE.print("[dim]已取消[/]\n")
-            return True
-        return handle_telegram_command(f"{action} {raw}", source="builtin")
-
-    if choice == "7":
-        return handle_telegram_command("allow-all", source="builtin")
-
-    if choice == "8":
-        return handle_telegram_command("whitelist", source="builtin")
-
-    if choice == "9":
-        try:
-            confirm = input("  确认重置并删除 Telegram 配置？输入 yes 确认: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            CONSOLE.print("\n[dim]已取消[/]\n")
-            return True
-        if confirm != "yes":
-            CONSOLE.print("[dim]已取消[/]\n")
-            return True
-        return handle_telegram_command("reset", source="builtin")
-
-    CONSOLE.print(f"[yellow]未知选项: {choice}[/]\n")
-    return True
-
-
-def handle_telegram_command(args: str, source: str = "cli") -> bool:
-    arg = (args or "").strip()
-    config = _read_telegram_config()
-    parts = arg.split(None, 1)
-    subcmd = parts[0].lower() if parts and parts[0] else ""
-    subarg = parts[1].strip() if len(parts) > 1 else ""
-
-    if subcmd == "":
-        if source == "builtin":
-            return _interactive_telegram_menu()
-        if not _telegram_is_configured(config):
-            CONSOLE.print("[yellow]Telegram 机器人尚未配置，进入配置向导[/]")
-            if not _ensure_ai_for_telegram():
-                return True
-            result = configure_telegram_cli()
-            if not result.get("success"):
-                return True
-            start_result = _start_telegram_daemon()
-            CONSOLE.print(
-                f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]"
-            )
-            CONSOLE.print()
-            return True
-        _print_telegram_status(include_commands=True)
-        return True
-
-    if subcmd in ("status", "info", "list", "ls"):
-        _print_telegram_status(include_commands=True)
-        return True
-
-    if subcmd in ("config", "setup"):
-        if not _ensure_ai_for_telegram():
-            return True
-        configure_telegram_cli()
-        return True
-
-    if subcmd in ("start", "run"):
-        if not _telegram_is_configured(config):
-            CONSOLE.print("[yellow]Telegram 机器人尚未配置，进入配置向导[/]")
-            if not _ensure_ai_for_telegram():
-                return True
-            result = configure_telegram_cli()
-            if not result.get("success"):
-                return True
-        elif not _ensure_ai_for_telegram():
-            return True
-        result = _start_telegram_daemon()
-        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
-        CONSOLE.print()
-        return True
-
-    if subcmd == "serve":
-        daemonized = "--daemonized" in _split_tokens(subarg)
-        sys.exit(serve_telegram_forever(daemonized=daemonized))
-
-    if subcmd == "stop":
-        result = _stop_telegram_daemon()
-        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
-        CONSOLE.print()
-        return True
-
-    if subcmd == "restart":
-        stop_result = _stop_telegram_daemon()
-        start_result = _start_telegram_daemon()
-        CONSOLE.print(
-            f"[{'green' if stop_result['success'] else 'red'}]{stop_result['message']}[/]"
-        )
-        CONSOLE.print(
-            f"[{'green' if start_result['success'] else 'red'}]{start_result['message']}[/]"
-        )
-        CONSOLE.print()
-        return True
-
-    if subcmd in ("allow", "add"):
-        if not subarg:
-            CONSOLE.print("[yellow]用法: gary telegram allow <chat_id|user:123> [...][/]\n")
-            return True
-        parsed = _parse_telegram_targets(subarg)
-        if parsed["invalid"]:
-            CONSOLE.print(f"[yellow]忽略非法项: {parsed['invalid']}[/]")
-        saved = _telegram_set_permissions(
-            add_chat_ids=parsed["chat_ids"],
-            add_user_ids=parsed["user_ids"],
-        )
-        CONSOLE.print("[green]Telegram 白名单已更新[/]")
-        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
-        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
-        return True
-
-    if subcmd in ("remove", "delete", "del", "rm"):
-        if not subarg:
-            CONSOLE.print("[yellow]用法: gary telegram remove <chat_id|user:123> [...][/]\n")
-            return True
-        parsed = _parse_telegram_targets(subarg)
-        if parsed["invalid"]:
-            CONSOLE.print(f"[yellow]忽略非法项: {parsed['invalid']}[/]")
-        saved = _telegram_set_permissions(
-            remove_chat_ids=parsed["chat_ids"],
-            remove_user_ids=parsed["user_ids"],
-        )
-        CONSOLE.print("[green]Telegram 白名单已更新[/]")
-        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
-        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
-        return True
-
-    if subcmd == "allow-all":
-        saved = _telegram_set_permissions(allow_all_chats=True)
-        CONSOLE.print("[green]已切换为允许所有 chat[/]")
-        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
-        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
-        return True
-
-    if subcmd == "whitelist":
-        saved = _telegram_set_permissions(allow_all_chats=False)
-        CONSOLE.print("[green]已切换为白名单模式[/]")
-        CONSOLE.print(f"  chat_id: {saved['allowed_chat_ids']}")
-        CONSOLE.print(f"  user_id: {saved['allowed_user_ids']}\n")
-        return True
-
-    if subcmd == "reset":
-        result = _reset_telegram_config()
-        CONSOLE.print(f"[{'green' if result['success'] else 'red'}]{result['message']}[/]")
-        CONSOLE.print()
-        return True
-
-    CONSOLE.print(f"[yellow]未知 Telegram 命令: {subcmd}[/]")
-    _print_telegram_status(include_commands=True)
-    return True
-
-
-def _shutdown_cli_runtime(stop_telegram: bool = True) -> dict:
-    """退出 CLI 时统一清理资源。"""
-    results = {
-        "hardware": stm32_disconnect(),
-        "bridge_stopped": False,
-        "telegram": {"success": True, "message": "Telegram 保持运行"},
-    }
-    try:
-        _telegram_bridge.stop()
-        results["bridge_stopped"] = True
-    except Exception as e:
-        results["bridge_stopped"] = False
-        results["bridge_error"] = str(e)
-    if stop_telegram:
-        try:
-            results["telegram"] = _stop_telegram_daemon()
-        except Exception as e:
-            results["telegram"] = {"success": False, "message": f"停止 Telegram 机器人失败: {e}"}
-    return results
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2694,54 +981,43 @@ def _wait_serial_adaptive(
 # ─────────────────────────────────────────────────────────────
 # 全局硬件状态（工具函数直接访问）
 # ─────────────────────────────────────────────────────────────
-_compiler: Optional[Compiler] = None
-_bridge: Optional[PyOCDBridge] = None
-_serial: Optional[SerialMonitor] = None
-_hw_connected = False
-_serial_connected = False
-_current_chip = DEFAULT_CHIP
-_last_bin_path: Optional[str] = None
-_last_code: Optional[str] = None
-_compiler_mtime: float = 0.0  # compiler.py 上次加载时的 mtime
-
-# 调试闭环计数器（每次新任务由 AI 调用 stm32_reset_debug_attempts 重置）
-_debug_attempt = 0
 MAX_DEBUG_ATTEMPTS = 8  # 提高上限，一个任务最多 8 轮（含修改迭代）
 
 
 def _get_compiler() -> Compiler:
-    """返回 Compiler 单例；若 compiler.py 磁盘文件已更新则自动热重载。"""
-    global _compiler, _compiler_mtime
+    """返回 Compiler 单例；若 compiler/ 包文件已更新则自动热重载。"""
+    ctx = get_context()
     import importlib
 
-    compiler_path = _HERE / "compiler.py"
     try:
-        mtime = compiler_path.stat().st_mtime
-    except OSError:
+        mtime = _compiler_module.get_package_mtime()
+    except Exception:
         mtime = 0.0
-    if mtime > _compiler_mtime:
-        importlib.reload(_compiler_module)
+    if mtime > ctx.compiler_mtime:
+        globals()["_compiler_module"] = importlib.reload(_compiler_module)
+        if hasattr(_compiler_module, "reload_package"):
+            _compiler_module.reload_package()
         globals()["Compiler"] = _compiler_module.Compiler
-        _compiler = None  # 旧实例作废，下方重新创建
-        _compiler_mtime = mtime
-    if _compiler is None:
-        _compiler = _compiler_module.Compiler()
-        _compiler.check(_current_chip)  # 探测 GCC/HAL，设置 has_gcc/has_hal
-    return _compiler
+        ctx.compiler = None  # 旧实例作废，下方重新创建
+        ctx.compiler_mtime = mtime
+    if ctx.compiler is None:
+        ctx.compiler = _compiler_module.Compiler()
+        ctx.compiler.check(ctx.chip)  # 探测 GCC/HAL，设置 has_gcc/has_hal
+    return ctx.compiler
 
 
 def _get_bridge() -> PyOCDBridge:
-    global _bridge
-    if _bridge is None:
-        _bridge = PyOCDBridge()
-    return _bridge
+    ctx = get_context()
+    if ctx.bridge is None:
+        ctx.bridge = PyOCDBridge()
+    return ctx.bridge
 
 
 def _get_serial() -> SerialMonitor:
-    global _serial
-    if _serial is None:
-        _serial = SerialMonitor()
-    return _serial
+    ctx = get_context()
+    if ctx.serial is None:
+        ctx.serial = SerialMonitor()
+    return ctx.serial
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2924,26 +1200,26 @@ def stm32_list_probes() -> dict:
 
 def stm32_connect(chip: str = None) -> dict:
     """连接 STM32 硬件（pyocd 探针 + 串口监控）"""
-    global _hw_connected, _serial_connected, _current_chip
+    ctx = get_context()
     # chip=None → 使用当前已知芯片或默认芯片，避免 pyocd 退化到 generic cortex_m
-    target_chip = chip or _current_chip or DEFAULT_CHIP
+    target_chip = chip or ctx.chip or DEFAULT_CHIP
     bridge = _get_bridge()
     serial = _get_serial()
 
     if bridge.start(target_chip):
-        _hw_connected = True
+        ctx.hw_connected = True
         # 用 pyocd 实际识别到的型号（自动检测场景下会与传入值不同）
-        _current_chip = bridge.chip_info.get("device", target_chip)
-        _get_compiler().set_chip(_current_chip)
-        _serial_connected = serial.open()
+        ctx.chip = bridge.chip_info.get("device", target_chip)
+        _get_compiler().set_chip(ctx.chip)
+        ctx.serial_connected = serial.open()
         return {
             "success": True,
-            "chip": _current_chip,
+            "chip": ctx.chip,
             "probe": bridge.chip_info.get("probe", ""),
-            "serial_connected": _serial_connected,
-            "message": f"硬件已连接: {_current_chip}",
+            "serial_connected": ctx.serial_connected,
+            "message": f"硬件已连接: {ctx.chip}",
         }
-    _hw_connected = False
+    ctx.hw_connected = False
     return {"success": False, "message": "连接失败，请检查探针 USB 连接和驱动"}
 
 
@@ -2952,17 +1228,17 @@ def stm32_serial_connect(port: str = None, baud: int = None) -> dict:
     单独连接/重连 UART 串口（不影响 pyocd 探针连接）。
     用于更换串口设备或在 stm32_connect 之后补充连接串口。
     """
-    global _serial_connected
+    ctx = get_context()
     serial = _get_serial()
     # 若已连接先关闭
     serial.close()
-    _serial_connected = False
+    ctx.serial_connected = False
 
     use_baud = baud or SERIAL_BAUD
     # port=None → 自动检测；否则先试指定端口，失败时扫描其他
-    _serial_connected = serial.open(port or None, use_baud)
+    ctx.serial_connected = serial.open(port or None, use_baud)
     actual_port = getattr(serial, "_port", port or "自动检测")
-    if _serial_connected:
+    if ctx.serial_connected:
         return {
             "success": True,
             "port": actual_port,
@@ -2980,39 +1256,40 @@ def stm32_serial_connect(port: str = None, baud: int = None) -> dict:
 
 def stm32_serial_disconnect() -> dict:
     """断开串口（保留 pyocd 探针连接）"""
-    global _serial_connected
+    ctx = get_context()
     _get_serial().close()
-    _serial_connected = False
+    ctx.serial_connected = False
     return {"success": True, "message": "串口已断开"}
 
 
 def stm32_disconnect() -> dict:
     """断开硬件连接（释放探针和串口）"""
-    global _hw_connected, _serial_connected
+    ctx = get_context()
     _get_bridge().stop()
     _get_serial().close()
-    _hw_connected = False
-    _serial_connected = False
+    ctx.hw_connected = False
+    ctx.serial_connected = False
     return {"success": True, "message": "已断开"}
 
 
 def stm32_set_chip(chip: str) -> dict:
     """切换目标芯片型号（如 STM32F103C8T6 / STM32F407VET6）"""
-    global _current_chip
-    _current_chip = chip.strip().upper()
-    ci = _get_compiler().set_chip(_current_chip)
-    if _hw_connected:
+    ctx = get_context()
+    ctx.chip = chip.strip().upper()
+    ci = _get_compiler().set_chip(ctx.chip)
+    if ctx.hw_connected:
         _get_bridge().set_family(ci.get("family", "f1"))
-    return {"success": True, "chip": _current_chip, "family": ci.get("family", "f1")}
+    return {"success": True, "chip": ctx.chip, "family": ci.get("family", "f1")}
 
 
 def stm32_hardware_status() -> dict:
     """获取当前硬件连接状态和工具链可用性"""
-    ci = _get_compiler().check(_current_chip)
+    ctx = get_context()
+    ci = _get_compiler().check(ctx.chip)
     return {
-        "chip": _current_chip,
-        "hw_connected": _hw_connected,
-        "serial_connected": _serial_connected,
+        "chip": ctx.chip,
+        "hw_connected": ctx.hw_connected,
+        "serial_connected": ctx.serial_connected,
         "gcc_ok": ci.get("gcc", False),
         "gcc_version": ci.get("gcc_version", "未找到"),
         "hal_ok": ci.get("hal", False),
@@ -3023,14 +1300,14 @@ def stm32_hardware_status() -> dict:
 
 def stm32_compile(code: str, chip: str = None) -> dict:
     """编译 STM32 C 代码（完整 main.c）"""
-    global _last_bin_path, _last_code
+    ctx = get_context()
     compiler = _get_compiler()
     if chip:
         compiler.set_chip(chip.strip().upper())
     result = compiler.compile(code)
     if result["ok"]:
-        _last_code = code
-        _last_bin_path = result.get("bin_path")
+        ctx.last_code = code
+        ctx.last_bin_path = result.get("bin_path")
         # 自动保存到 latest_workspace
         try:
             latest = Path.home() / ".stm32_agent" / "workspace" / "projects" / "latest_workspace"
@@ -3045,20 +1322,26 @@ def stm32_compile(code: str, chip: str = None) -> dict:
         "bin_size": result.get("bin_size", 0),
     }
     if payload["success"]:
-        _record_success_memory("compile_success", code=code, result=payload)
+        _record_success_memory(
+            "compile_success",
+            code=code,
+            result=payload,
+            chip=get_context().chip,
+            log_error=telegram_log,
+        )
     return payload
 
 
 def stm32_compile_rtos(code: str, chip: str = None) -> dict:
     """编译带 FreeRTOS 内核的完整 main.c 代码"""
-    global _last_bin_path, _last_code
+    ctx = get_context()
     compiler = _get_compiler()
     if chip:
         compiler.set_chip(chip.strip().upper())
     result = compiler.compile_rtos(code)
     if result["ok"]:
-        _last_code = code
-        _last_bin_path = result.get("bin_path")
+        ctx.last_code = code
+        ctx.last_bin_path = result.get("bin_path")
         try:
             latest = Path.home() / ".stm32_agent" / "workspace" / "projects" / "latest_workspace"
             latest.mkdir(parents=True, exist_ok=True)
@@ -3072,7 +1355,13 @@ def stm32_compile_rtos(code: str, chip: str = None) -> dict:
         "bin_size": result.get("bin_size", 0),
     }
     if payload["success"]:
-        _record_success_memory("compile_success", code=code, result=payload)
+        _record_success_memory(
+            "compile_success",
+            code=code,
+            result=payload,
+            chip=get_context().chip,
+            log_error=telegram_log,
+        )
     return payload
 
 
@@ -3099,28 +1388,29 @@ def stm32_recompile(mode: str = "auto") -> dict:
 
 def stm32_regen_bsp(chip: str = None) -> dict:
     """强制重新生成 startup.s / link.ld / FreeRTOSConfig.h。
-    每次修改 compiler.py 或切换芯片后调用一次，确保构建文件是最新版本。
+    每次修改 compiler/ 包或切换芯片后调用一次，确保构建文件是最新版本。
     自动检查 startup.s 是否包含 FPU 使能代码（Cortex-M4 必须）。
     """
     import importlib
 
-    # 强制重载 compiler 模块，绕过进程内缓存
-    importlib.reload(_compiler_module)
+    # 强制重载 compiler 包，绕过进程内缓存
+    globals()["_compiler_module"] = importlib.reload(_compiler_module)
+    if hasattr(_compiler_module, "reload_package"):
+        _compiler_module.reload_package()
     globals()["Compiler"] = _compiler_module.Compiler
-    global _compiler, _compiler_mtime
-    _compiler = None
+    ctx = get_context()
+    ctx.compiler = None
     try:
-        compiler_path = _HERE / "compiler.py"
-        _compiler_mtime = compiler_path.stat().st_mtime
-    except OSError:
-        _compiler_mtime = 0.0
+        ctx.compiler_mtime = _compiler_module.get_package_mtime()
+    except Exception:
+        ctx.compiler_mtime = 0.0
 
     compiler = _get_compiler()
     if chip:
         compiler.set_chip(chip.strip().upper())
 
     # 调用 set_chip 触发 startup.s / link.ld 重新生成
-    chip_name = chip.strip().upper() if chip else _current_chip
+    chip_name = chip.strip().upper() if chip else ctx.chip
     ci = compiler.set_chip(chip_name)
     if ci is None:
         return {"success": False, "message": f"未知芯片: {chip_name}"}
@@ -3141,7 +1431,7 @@ def stm32_regen_bsp(chip: str = None) -> dict:
 
     warnings = []
     if fpu and not has_fpu_enable:
-        warnings.append("⚠ startup.s 缺少 FPU 使能代码——请更新 compiler.py")
+        warnings.append("⚠ startup.s 缺少 FPU 使能代码——请更新 compiler/ 包")
     if ram_k < 32 and ci.get("family") in ("f4",):
         warnings.append(f"⚠ RAM 仅 {ram_k}KB，FreeRTOS heap 可能不够")
 
@@ -3169,7 +1459,7 @@ def stm32_analyze_fault_rtos() -> dict:
     - 检查 startup.s 是否包含 FPU 初始化
     返回明确的根本原因和修复建议。
     """
-    if not _hw_connected:
+    if not get_context().hw_connected:
         return {"success": False, "message": "硬件未连接"}
 
     bridge = _get_bridge()
@@ -3237,7 +1527,7 @@ def stm32_analyze_fault_rtos() -> dict:
             "FPU 未使能：ARM_CM4F port.c 的 PendSV_Handler 执行 vpush/vpop 时触发 PRECISERR"
         )
         fix = (
-            "修复方法（已在 compiler.py 修复，重新编译即可）：\n"
+            "修复方法（已在 compiler/ 包修复，重新编译即可）：\n"
             "  1. 调用 stm32_regen_bsp() 重新生成 startup.s（含 CPACR 初始化）\n"
             "  2. 重新编译：stm32_compile_rtos(code)\n"
             "  不需要在代码里手动写 SCB->CPACR"
@@ -3440,7 +1730,7 @@ def stm32_rtos_task_stats() -> dict:
     从 ELF 符号表解析全局变量地址，读取任务数、堆使用、当前任务等。
     需要先编译（有 ELF 文件）并连接硬件。
     """
-    if not _hw_connected:
+    if not get_context().hw_connected:
         return {"success": False, "message": "硬件未连接"}
 
     from config import BUILD_DIR
@@ -3976,9 +2266,10 @@ def stm32_rtos_plan_project(
 
 def stm32_flash(bin_path: str = None) -> dict:
     """烧录固件到 STM32（需要先 connect + compile）"""
-    if not _hw_connected:
+    ctx = get_context()
+    if not ctx.hw_connected:
         return {"success": False, "message": "硬件未连接，请先调用 stm32_connect"}
-    path = bin_path or _last_bin_path
+    path = bin_path or ctx.last_bin_path
     if not path or not Path(path).exists():
         return {"success": False, "message": f"固件文件不存在: {path}"}
     _get_serial().clear()
@@ -3988,7 +2279,7 @@ def stm32_flash(bin_path: str = None) -> dict:
 
 def stm32_read_registers(regs: list = None) -> dict:
     """读取 STM32 硬件寄存器（RCC、GPIO、TIM、UART 等）"""
-    if not _hw_connected:
+    if not get_context().hw_connected:
         return {"success": False, "message": "硬件未连接"}
     result = _get_bridge().read_registers(regs) if regs else _get_bridge().read_all_for_debug()
     if result is not None:
@@ -3998,7 +2289,7 @@ def stm32_read_registers(regs: list = None) -> dict:
 
 def stm32_analyze_fault() -> dict:
     """读取并分析 HardFault 寄存器（SCB_CFSR / SCB_HFSR）"""
-    if not _hw_connected:
+    if not get_context().hw_connected:
         return {"success": False, "message": "硬件未连接"}
     regs = _get_bridge().read_registers(["SCB_CFSR", "SCB_HFSR", "SCB_BFAR", "PC"])
     if not regs:
@@ -4009,7 +2300,7 @@ def stm32_analyze_fault() -> dict:
 
 def stm32_serial_read(timeout: float = 3.0, wait_for: str = None) -> dict:
     """读取 UART 串口输出（调试日志）"""
-    if not _serial_connected:
+    if not get_context().serial_connected:
         return {"success": False, "message": "串口未连接"}
     serial = _get_serial()
     if wait_for:
@@ -4022,8 +2313,7 @@ def stm32_serial_read(timeout: float = 3.0, wait_for: str = None) -> dict:
 
 def stm32_reset_debug_attempts() -> dict:
     """重置调试轮次计数器。开始一个全新需求时调用，确保计数从 1 开始。"""
-    global _debug_attempt
-    _debug_attempt = 0
+    get_context().debug_attempt = 0
     return {"success": True, "message": "计数器已重置"}
 
 
@@ -4033,9 +2323,9 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
       编译 → 烧录（若已连接硬件）→ 等待启动 → 读串口 → 读寄存器
     返回每步结果 + 当前轮次 + 是否应放弃。
     """
-    global _last_code, _last_bin_path, _debug_attempt
-    _debug_attempt += 1
-    attempt = _debug_attempt
+    ctx = get_context()
+    ctx.debug_attempt += 1
+    attempt = ctx.debug_attempt
     steps = []
 
     # 超出最大轮次 → 直接告知 AI 放弃
@@ -4066,7 +2356,7 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
         }
 
     # 2. 烧录（失败时延迟重试，最多2次）
-    if _hw_connected and comp.get("bin_path"):
+    if ctx.hw_connected and comp.get("bin_path"):
         fr = stm32_flash(comp["bin_path"])
         if not fr["success"]:
             for retry in range(2):
@@ -4075,7 +2365,7 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
                     f"[yellow]  烧录失败（{fr['message'][:60]}），{wait_sec:.0f}s 后重连重试...[/]"
                 )
                 time.sleep(wait_sec)
-                stm32_connect(_current_chip)
+                stm32_connect(ctx.chip)
                 fr = stm32_flash(comp["bin_path"])
                 if fr["success"]:
                     break
@@ -4092,7 +2382,7 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
         # 3. 串口监控
         uart_out = ""
         sensor_errors = []
-        if _serial_connected:
+        if ctx.serial_connected:
             CONSOLE.print("[dim]  等待启动...[/]")
             uart_out = _wait_serial_adaptive(
                 _get_serial(),
@@ -4205,6 +2495,8 @@ def stm32_auto_flash_cycle(code: str, request: str = "") -> dict:
                 result=comp,
                 request=request,
                 steps=steps,
+                chip=ctx.chip,
+                log_error=telegram_log,
             )
             return {
                 "success": True,
@@ -4264,7 +2556,7 @@ def stm32_save_code(code: str, request: str = "untitled") -> dict:
 
 def _stm32_save_project(code: str, comp: dict, request: str) -> Path:
     """内部：保存项目文件"""
-    global _last_code
+    ctx = get_context()
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe = "".join(c if c.isalnum() or c in "_- " else "" for c in request[:30]).strip()
     d = PROJECTS_DIR / f"{ts}_{safe}"
@@ -4275,7 +2567,7 @@ def _stm32_save_project(code: str, comp: dict, request: str) -> Path:
     (d / "config.json").write_text(
         json.dumps(
             {
-                "chip": _current_chip,
+                "chip": ctx.chip,
                 "request": request,
                 "bin_size": comp.get("bin_size", 0),
                 "timestamp": ts,
@@ -4284,7 +2576,7 @@ def _stm32_save_project(code: str, comp: dict, request: str) -> Path:
             indent=2,
         )
     )
-    _last_code = code
+    ctx.last_code = code
     # 同步更新 latest_workspace，保证 stm32_recompile 始终能找到最新代码
     try:
         latest = Path.home() / ".stm32_agent" / "workspace" / "projects" / "latest_workspace"
@@ -4948,1604 +3240,74 @@ def computer_keyboard_type(text: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 # 工具注册表
 # ─────────────────────────────────────────────────────────────
-TOOLS_MAP: Dict[str, Any] = {
-    # STM32 专属
-    "stm32_list_probes": stm32_list_probes,
-    "stm32_connect": stm32_connect,
-    "stm32_disconnect": stm32_disconnect,
-    "stm32_serial_connect": stm32_serial_connect,
-    "stm32_serial_disconnect": stm32_serial_disconnect,
-    "stm32_set_chip": stm32_set_chip,
-    "stm32_hardware_status": stm32_hardware_status,
-    "stm32_compile": stm32_compile,
-    "stm32_compile_rtos": stm32_compile_rtos,
-    "stm32_recompile": stm32_recompile,
-    "stm32_regen_bsp": stm32_regen_bsp,
-    "stm32_analyze_fault_rtos": stm32_analyze_fault_rtos,
-    "stm32_rtos_check_code": stm32_rtos_check_code,
-    "stm32_rtos_task_stats": stm32_rtos_task_stats,
-    "stm32_rtos_suggest_config": stm32_rtos_suggest_config,
-    "stm32_rtos_plan_project": stm32_rtos_plan_project,
-    "stm32_flash": stm32_flash,
-    "stm32_read_registers": stm32_read_registers,
-    "stm32_analyze_fault": stm32_analyze_fault,
-    "stm32_serial_read": stm32_serial_read,
-    "stm32_auto_flash_cycle": stm32_auto_flash_cycle,
-    "stm32_reset_debug_attempts": stm32_reset_debug_attempts,
-    "stm32_generate_font": stm32_generate_font,
-    "stm32_save_code": stm32_save_code,
-    "stm32_list_projects": stm32_list_projects,
-    "stm32_read_project": stm32_read_project,
-    "gary_save_member_memory": gary_save_member_memory,
-    # 通用
-    "read_file": read_file,
-    "create_or_overwrite_file": create_or_overwrite_file,
-    "str_replace_edit": str_replace_edit,
-    "list_directory": list_directory,
-    "execute_command": execute_command,
-    "search_files": search_files,
-    "web_search": web_search,
-    # 扩展通用工具
-    "append_file_content": append_file_content,
-    "grep_search": grep_search,
-    "execute_batch_commands": execute_batch_commands,
-    "fetch_url": fetch_url,
-    "get_current_time": get_current_time,
-    "ask_human": ask_human,
-    "git_status": git_status,
-    "git_diff": git_diff,
-    "git_commit": git_commit,
-    "edit_file_lines": edit_file_lines,
-    "insert_content_by_regex": insert_content_by_regex,
-    "check_python_code": check_python_code,
-    "run_python_code": run_python_code,
-    # Word 文档工具
-    "read_docx": read_docx,
-    "replace_docx_text": replace_docx_text,
-    "append_docx_content": append_docx_content,
-    "inspect_docx_structure": inspect_docx_structure,
-    "insert_docx_content_after_heading": insert_docx_content_after_heading,
-    # 电脑控制工具
-    "computer_screenshot": computer_screenshot,
-    "computer_mouse_move": computer_mouse_move,
-    "computer_mouse_click": computer_mouse_click,
-    "computer_keyboard_type": computer_keyboard_type,
-}
-TOOLS_MAP.update(EXTRA_TOOLS_MAP)
-TOOLS_MAP.update(SKILL_TOOLS_MAP)
-
-# ─────────────────────────────────────────────────────────────
-# Tool Schemas（供 AI 调用）
-# ─────────────────────────────────────────────────────────────
-TOOL_SCHEMAS = [
+bind_tool_implementations(
     {
-        "type": "function",
-        "function": {
-            "name": "stm32_list_probes",
-            "description": "列出所有已连接的调试探针（ST-Link、CMSIS-DAP、J-Link）。连接前先调用此函数确认探针存在。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_connect",
-            "description": "连接 STM32 硬件（pyocd 探针 + UART 串口）。烧录前必须先调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chip": {
-                        "type": "string",
-                        "description": "芯片型号，如 STM32F103C8T6（可选，不填用当前设置）",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_disconnect",
-            "description": "断开探针和串口连接。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_serial_connect",
-            "description": (
-                "单独连接/重连 UART 串口监控（不影响 pyocd 探针）。"
-                "串口用于接收 Debug_Print 日志和 Gary:BOOT 启动标记，是 AI 判断程序运行状态的关键。"
-                "stm32_connect 会自动尝试用默认端口连接，若失败或需要更换端口时调用此函数。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "port": {
-                        "type": "string",
-                        "description": "串口设备路径，如 /dev/ttyUSB0、/dev/ttyAMA0（不填用 config.py 默认值）",
-                    },
-                    "baud": {"type": "integer", "description": "波特率，默认 115200"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_serial_disconnect",
-            "description": "断开串口（保留探针连接）。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_set_chip",
-            "description": "切换目标芯片型号，同时更新寄存器地址表。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chip": {
-                        "type": "string",
-                        "description": "芯片完整型号，如 STM32F103C8T6 / STM32F407VET6",
-                    },
-                },
-                "required": ["chip"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_hardware_status",
-            "description": "查询当前硬件状态：芯片型号、探针/串口连接状态、GCC 版本、HAL 库是否就绪。开始工作前建议先调用。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_compile",
-            "description": "使用 arm-none-eabi-gcc + HAL 库编译完整的 main.c 代码，返回编译结果和 bin 路径。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "完整的 main.c 代码（含所有 #include 和函数定义）",
-                    },
-                    "chip": {"type": "string", "description": "可选：临时指定芯片型号"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_compile_rtos",
-            "description": "使用 arm-none-eabi-gcc + HAL + FreeRTOS Kernel 编译带 RTOS 的完整 main.c 代码。"
-            "仅在用户需要 FreeRTOS 多任务时使用，裸机项目使用 stm32_compile。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "完整的 main.c 代码（含 FreeRTOS 头文件和任务定义）",
-                    },
-                    "chip": {"type": "string", "description": "可选：临时指定芯片型号"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_recompile",
-            "description": (
-                "直接从 latest_workspace/main.c 重新编译，无需传递代码字符串。"
-                "str_replace_edit 修改文件后使用此工具代替 read_file + stm32_compile，"
-                "节省 token，避免代码传输中的幻觉。"
-                "mode='auto' 自动检测裸机或 RTOS；mode='bare' 强制裸机；mode='rtos' 强制 FreeRTOS。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "enum": ["auto", "bare", "rtos"],
-                        "description": "编译模式：auto(自动检测)、bare(裸机)、rtos(FreeRTOS)。默认 auto。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_regen_bsp",
-            "description": (
-                "强制重新生成 BSP 文件（startup.s、link.ld、FreeRTOSConfig.h）并验证 FPU 使能代码。"
-                "在切换芯片型号后、FreeRTOS 编译前、或怀疑 startup.s 不含 CPACR 初始化时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chip": {
-                        "type": "string",
-                        "description": "可选：指定芯片型号（如 STM32F411CE）",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_analyze_fault_rtos",
-            "description": (
-                "FreeRTOS 专用 HardFault 分析。读取 SCB_CFSR/HFSR/BFAR/PC，"
-                "检查 startup.s FPU 使能状态，给出 FPU 未使能、栈溢出、非法地址等具体诊断。"
-                "FreeRTOS 程序 HardFault 时优先调用此工具而非 stm32_analyze_fault。"
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_rtos_check_code",
-            "description": (
-                "FreeRTOS 代码静态检查 —— 编译前自动检测常见 RTOS 编程错误。"
-                "检查项：SysTick_Handler 冲突、HAL_Delay 陷阱、缺少 hook 函数、"
-                "任务栈大小不足、ISR 中使用非 FromISR API、缺少头文件等。"
-                "编写 RTOS 代码后、调用 stm32_compile_rtos 前使用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "完整的 main.c 代码"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_rtos_task_stats",
-            "description": (
-                "读取 FreeRTOS 运行时任务统计：任务数、堆剩余/历史最低、当前任务名。"
-                "通过 ELF 符号表定位内存地址，用 pyocd 读取。"
-                "需要已编译（有 ELF）且硬件已连接。用于性能分析和堆使用诊断。"
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_rtos_suggest_config",
-            "description": (
-                "根据任务需求计算推荐的 FreeRTOS 配置：栈大小、堆大小、优先级数。"
-                "评估 RAM 使用率并给出警告。在规划 RTOS 程序前调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_count": {
-                        "type": "integer",
-                        "description": "计划创建的任务数量（不含 Idle 和 Timer）",
-                    },
-                    "use_fpu": {
-                        "type": "boolean",
-                        "description": "任务是否使用浮点运算（默认 false）",
-                    },
-                    "use_printf": {
-                        "type": "boolean",
-                        "description": "任务是否使用 snprintf（默认 false）",
-                    },
-                    "ram_k": {
-                        "type": "integer",
-                        "description": "可选：指定 RAM 大小(KB)，不填用当前芯片参数",
-                    },
-                },
-                "required": ["task_count"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_rtos_plan_project",
-            "description": (
-                "FreeRTOS 项目架构规划 —— 复杂 RTOS 项目的必备第一步。"
-                "根据需求描述自动生成：任务分解、通信拓扑、中断策略、外设分配、资源估算。"
-                "满足以下任一条件时必须调用：①任务数≥3 ②涉及中断+任务通信 ③涉及多个外设协同 ④涉及控制算法。"
-                "规划结果需向用户展示并确认后再写代码。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "用户需求的完整描述（中文），包含功能要求、外设需求、性能要求等",
-                    },
-                    "peripherals": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": '可选：明确指定的外设列表，如 ["uart", "i2c", "adc", "pwm"]',
-                    },
-                    "task_hints": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": '可选：用户指定的任务名称提示，如 ["SensorTask", "MotorTask"]',
-                    },
-                },
-                "required": ["description"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_flash",
-            "description": "通过 pyocd 将已编译的固件烧录到 STM32。需要先 connect 和 compile。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "bin_path": {
-                        "type": "string",
-                        "description": "可选：bin 文件路径，不填则用上次编译结果",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_read_registers",
-            "description": "读取 STM32 关键寄存器（RCC、GPIO ODR/IDR、TIM、UART、I2C 等）。只在 stm32_auto_flash_cycle 未返回寄存器数据时补充调用一次，禁止循环重复调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "regs": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": '可选：指定寄存器名称列表，如 ["RCC_APB2ENR", "GPIOA_CRL"]。不填读取所有调试寄存器。',
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_analyze_fault",
-            "description": "读取并分析 HardFault 状态寄存器（SCB_CFSR/HFSR/BFAR + PC），定位故障原因。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_serial_read",
-            "description": "读取 UART 串口输出（调试日志、错误信息）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timeout": {"type": "number", "description": "读取超时（秒），默认 3.0"},
-                    "wait_for": {
-                        "type": "string",
-                        "description": "可选：等待直到出现此字符串（如 Gary:）",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_auto_flash_cycle",
-            "description": (
-                "完整开发闭环（推荐）：编译 → 烧录 → 读串口 → 读寄存器，一步到位。"
-                "代码生成后直接调用此函数，获取完整的验证结果。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "完整的 main.c 代码"},
-                    "request": {"type": "string", "description": "需求描述（用于保存项目，可选）"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_reset_debug_attempts",
-            "description": (
-                "重置调试轮次计数器。必须调用的场景：(1)全新需求 (2)用户要求修改功能/显示内容/引脚/逻辑。"
-                "不调用的场景：仅在修复上一轮的编译错误/烧录失败/运行异常时继续重试。"
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_generate_font",
-            "description": (
-                "将任意文字（含中文）渲染为真实字模 C 数组，使用系统字体精确生成，"
-                "固定格式：横向取模·高位在前（row-major MSB=left），并附带配套的 OLED_ShowFontN() 显示函数。"
-                "返回的 c_code 包含字模数组 + 显示函数，直接粘贴进 main.c 使用，无需修改。"
-                "显示中文/特殊字符时必须先调用此工具，禁止手写字模数据。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要生成字模的文字，如 '你好世界'"},
-                    "size": {
-                        "type": "integer",
-                        "description": "字体大小（像素），默认 16，常用 8/12/16/24/32",
-                        "default": 16,
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_save_code",
-            "description": "将代码保存到项目目录（不编译，仅保存源码）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "main.c 代码内容"},
-                    "request": {"type": "string", "description": "项目描述（作为目录名）"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_list_projects",
-            "description": "列出最近 15 个历史项目（名称、芯片、需求描述、时间）。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "stm32_read_project",
-            "description": "读取指定历史项目的 main.c 源码，用于查看或修改。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "project_name": {
-                        "type": "string",
-                        "description": "项目目录名（从 stm32_list_projects 获取）",
-                    },
-                },
-                "required": ["project_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "gary_save_member_memory",
-            "description": (
-                "把高价值、可复用的经验写入 member.md。"
-                "适用于：成功模板、关键初始化顺序、硬件易错点、寄存器判定经验、RTOS/裸机专项坑。"
-                "禁止写冗长日志，必须提炼成短而可执行的结论。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "经验标题，简短具体，如“F103 裸机 UART 先打 Gary:BOOT 再启 I2C”",
-                    },
-                    "experience": {
-                        "type": "string",
-                        "description": "经验正文，2-6 行为宜，写成可复用的做法/结论",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": '可选标签，如 ["baremetal", "uart", "i2c", "boot_marker"]',
-                    },
-                    "importance": {
-                        "type": "string",
-                        "enum": ["medium", "high", "critical"],
-                        "description": "经验重要度，默认 high。",
-                    },
-                },
-                "required": ["title", "experience"],
-            },
-        },
-    },
-    # 通用工具
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取文件内容（带行号）。",
-            "parameters": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_or_overwrite_file",
-            "description": "创建或完全覆盖一个文件。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["file_path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "str_replace_edit",
-            "description": "精确替换文件中的字符串（old_str 必须在文件中唯一，包含 3-5 行上下文）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string"},
-                    "old_str": {
-                        "type": "string",
-                        "description": "要替换的原文（必须唯一，包含足够上下文）",
-                    },
-                    "new_str": {"type": "string", "description": "替换后的新文"},
-                },
-                "required": ["file_path", "old_str", "new_str"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "列出目录内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "执行 Shell 命令（如查看日志、安装包、运行脚本等）。",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "按文件名关键字搜索文件。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "path": {"type": "string", "description": "搜索目录（默认当前）"},
-                    "file_type": {"type": "string", "description": "扩展名过滤，如 .c / .h"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "网络搜索（需要本地 SearXNG 实例）。",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    },
-    # ── 扩展通用工具 ──────────────────────────────────────────
-    {
-        "type": "function",
-        "function": {
-            "name": "append_file_content",
-            "description": "向文件末尾追加内容（代码/文本文件）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "目标文件路径"},
-                    "content": {"type": "string", "description": "要追加的内容"},
-                },
-                "required": ["file_path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep_search",
-            "description": "在文件中递归搜索正则表达式模式，返回匹配位置和内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "正则表达式模式"},
-                    "path": {"type": "string", "description": "搜索目录（默认 .）"},
-                    "include_extension": {"type": "string", "description": "按扩展名过滤，如 .py"},
-                    "recursive": {"type": "boolean", "description": "是否递归（默认 True）"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_batch_commands",
-            "description": "批量顺序执行多条 Shell 命令，默认遇错停止。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "commands": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "命令列表",
-                    },
-                    "stop_on_error": {
-                        "type": "boolean",
-                        "description": "遇错是否停止（默认 True）",
-                    },
-                },
-                "required": ["commands"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": "抓取 URL 页面并返回纯文本内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "要获取的 URL"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "获取当前系统时间、星期和时区。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_human",
-            "description": "向用户提问，等待用户在终端输入回答。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "要问用户的问题"},
-                },
-                "required": ["question"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_status",
-            "description": "执行 git status，查看当前仓库的文件修改状态。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_diff",
-            "description": "执行 git diff，查看实际代码变更内容。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_commit",
-            "description": "执行 git commit -m <message> 提交变更。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "提交信息"},
-                },
-                "required": ["message"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file_lines",
-            "description": (
-                "基于行号编辑文件（优先使用 str_replace_edit）。\n"
-                "操作类型：replace（替换行范围）、insert（在行前插入）、delete（删除行范围）。\n"
-                "仅在无法用 str_replace_edit 时使用（如在空白处插入新代码）。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "文件路径"},
-                    "operation": {
-                        "type": "string",
-                        "enum": ["replace", "insert", "delete"],
-                        "description": "操作类型",
-                    },
-                    "start_line": {"type": "integer", "description": "起始行（1-indexed）"},
-                    "end_line": {
-                        "type": "integer",
-                        "description": "结束行（可选，默认等于 start_line）",
-                    },
-                    "new_content": {
-                        "type": "string",
-                        "description": "新内容（replace/insert 时必填）",
-                    },
-                },
-                "required": ["file_path", "operation", "start_line"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "insert_content_by_regex",
-            "description": "在文件中第一个正则匹配位置之后插入内容，适合向类/函数后添加新方法。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "文件路径"},
-                    "regex_pattern": {
-                        "type": "string",
-                        "description": "用于定位插入点的正则表达式",
-                    },
-                    "content": {"type": "string", "description": "要插入的内容"},
-                },
-                "required": ["file_path", "regex_pattern", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_python_code",
-            "description": "检查 Python 文件的语法错误和代码风格（flake8/ast）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Python 文件路径（.py）"},
-                },
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python_code",
-            "description": "执行 Python 代码片段（临时文件沙箱），用于验证逻辑或测试库。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "要执行的 Python 代码"},
-                },
-                "required": ["code"],
-            },
-        },
-    },
-    # ── Word 文档工具 ──────────────────────────────────────────
-    {
-        "type": "function",
-        "function": {
-            "name": "read_docx",
-            "description": "读取 Word 文档(.docx)的文本内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": ".docx 文件路径"},
-                },
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "replace_docx_text",
-            "description": "替换 Word 文档中的文本（尽量保留格式，支持正则）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": ".docx 文件路径"},
-                    "old_text": {"type": "string", "description": "要查找的文本或正则模式"},
-                    "new_text": {"type": "string", "description": "替换为的新文本"},
-                    "use_regex": {
-                        "type": "boolean",
-                        "description": "是否启用正则匹配（默认 False）",
-                    },
-                },
-                "required": ["file_path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "append_docx_content",
-            "description": "向 Word 文档追加内容，可追加到末尾或指定段落索引之后。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": ".docx 文件路径"},
-                    "content": {"type": "string", "description": "要追加的内容（\\n 分隔多段落）"},
-                    "after_paragraph_index": {
-                        "type": "integer",
-                        "description": "插入位置段落索引（不填则追加到末尾）",
-                    },
-                    "style": {
-                        "type": "string",
-                        "description": "Word 样式名，如 'Heading 1'、'Normal'（可选）",
-                    },
-                },
-                "required": ["file_path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_docx_structure",
-            "description": "查看 Word 文档段落结构（索引和内容预览），用于确定插入位置。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": ".docx 文件路径"},
-                    "max_paragraphs": {
-                        "type": "integer",
-                        "description": "最多显示段落数（默认 50）",
-                    },
-                },
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "insert_docx_content_after_heading",
-            "description": "在 Word 文档指定标题段落之后插入内容（大小写不敏感匹配）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": ".docx 文件路径"},
-                    "heading_text": {
-                        "type": "string",
-                        "description": "目标标题文本（大小写不敏感）",
-                    },
-                    "content": {"type": "string", "description": "要插入的内容"},
-                    "style": {"type": "string", "description": "Word 样式（可选）"},
-                },
-                "required": ["file_path", "heading_text", "content"],
-            },
-        },
-    },
-    # ── 电脑控制工具 ──────────────────────────────────────────
-    {
-        "type": "function",
-        "function": {
-            "name": "computer_screenshot",
-            "description": "截取当前桌面截图，返回保存路径。",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "computer_mouse_move",
-            "description": "移动鼠标到指定坐标（x, y）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer", "description": "X 坐标"},
-                    "y": {"type": "integer", "description": "Y 坐标"},
-                },
-                "required": ["x", "y"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "computer_mouse_click",
-            "description": "在当前鼠标位置点击（left/right/double）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "button": {
-                        "type": "string",
-                        "enum": ["left", "right", "double"],
-                        "description": "点击类型（默认 left）",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "computer_keyboard_type",
-            "description": "向当前焦点窗口输入文本。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "要输入的文本"},
-                },
-                "required": ["text"],
-            },
-        },
-    },
-]
-TOOL_SCHEMAS.extend(EXTRA_TOOL_SCHEMAS)
-TOOL_SCHEMAS.extend(SKILL_TOOL_SCHEMAS)
-_skill_mgr = init_skills(TOOLS_MAP, TOOL_SCHEMAS)
+        # STM32 专属
+        "stm32_list_probes": stm32_list_probes,
+        "stm32_connect": stm32_connect,
+        "stm32_disconnect": stm32_disconnect,
+        "stm32_serial_connect": stm32_serial_connect,
+        "stm32_serial_disconnect": stm32_serial_disconnect,
+        "stm32_set_chip": stm32_set_chip,
+        "stm32_hardware_status": stm32_hardware_status,
+        "stm32_compile": stm32_compile,
+        "stm32_compile_rtos": stm32_compile_rtos,
+        "stm32_recompile": stm32_recompile,
+        "stm32_regen_bsp": stm32_regen_bsp,
+        "stm32_analyze_fault_rtos": stm32_analyze_fault_rtos,
+        "stm32_rtos_check_code": stm32_rtos_check_code,
+        "stm32_rtos_task_stats": stm32_rtos_task_stats,
+        "stm32_rtos_suggest_config": stm32_rtos_suggest_config,
+        "stm32_rtos_plan_project": stm32_rtos_plan_project,
+        "stm32_flash": stm32_flash,
+        "stm32_read_registers": stm32_read_registers,
+        "stm32_analyze_fault": stm32_analyze_fault,
+        "stm32_serial_read": stm32_serial_read,
+        "stm32_auto_flash_cycle": stm32_auto_flash_cycle,
+        "stm32_reset_debug_attempts": stm32_reset_debug_attempts,
+        "stm32_generate_font": stm32_generate_font,
+        "stm32_save_code": stm32_save_code,
+        "stm32_list_projects": stm32_list_projects,
+        "stm32_read_project": stm32_read_project,
+        "gary_save_member_memory": gary_save_member_memory,
+        # 通用
+        "read_file": read_file,
+        "create_or_overwrite_file": create_or_overwrite_file,
+        "str_replace_edit": str_replace_edit,
+        "list_directory": list_directory,
+        "execute_command": execute_command,
+        "search_files": search_files,
+        "web_search": web_search,
+        # 扩展通用工具
+        "append_file_content": append_file_content,
+        "grep_search": grep_search,
+        "execute_batch_commands": execute_batch_commands,
+        "fetch_url": fetch_url,
+        "get_current_time": get_current_time,
+        "ask_human": ask_human,
+        "git_status": git_status,
+        "git_diff": git_diff,
+        "git_commit": git_commit,
+        "edit_file_lines": edit_file_lines,
+        "insert_content_by_regex": insert_content_by_regex,
+        "check_python_code": check_python_code,
+        "run_python_code": run_python_code,
+        # Word 文档工具
+        "read_docx": read_docx,
+        "replace_docx_text": replace_docx_text,
+        "append_docx_content": append_docx_content,
+        "inspect_docx_structure": inspect_docx_structure,
+        "insert_docx_content_after_heading": insert_docx_content_after_heading,
+        # 电脑控制工具
+        "computer_screenshot": computer_screenshot,
+        "computer_mouse_move": computer_mouse_move,
+        "computer_mouse_click": computer_mouse_click,
+        "computer_keyboard_type": computer_keyboard_type,
+    }
+)
 
 # ─────────────────────────────────────────────────────────────
 # STM32 系统提示词
-STM32_BASE_SYSTEM_PROMPT = """你是 Gary Dev Agent，专为 STM32 嵌入式开发设计的 AI 助手，深度集成了编译、烧录、调试工具链。
-
-## 核心能力
-1. **代码生成**：根据自然语言需求生成完整可编译的 STM32 HAL C 代码
-2. **编译验证**：调用 arm-none-eabi-gcc 编译，立即发现并修复错误
-3. **固件烧录**：通过 pyocd 将固件烧录到 STM32（支持 ST-Link / CMSIS-DAP / J-Link）
-4. **硬件调试**：读取外设寄存器，分析 HardFault，监控 UART 日志
-5. **代码修改**：对话式增量修改，保留已有逻辑
-
-## 标准工作流
-
-### 串口监控（AI 判断程序运行状态的唯一来源）
-- 串口 = STM32 UART TX → USB-TTL 适配器 → 主机 `/dev/ttyUSBx` 或 `/dev/ttyAMAx`
-- `stm32_hardware_status` 返回 `serial_connected: false` 时，**必须提醒用户连接串口**
-- 用户可用 `/serial /dev/ttyUSB0` 连接，或告诉 AI 调用 `stm32_serial_connect(port=...)`
-- 无串口时 AI 无法看到 `Gary:BOOT`、`Debug_Print` 输出和运行时错误，调试能力严重受限
-- 烧录成功但无串口时，在回复末尾加一句：`⚠️ 串口未连接，无法监控运行状态`
-
-### 全新代码生成 / 功能修改
-1. 调用 `stm32_reset_debug_attempts` — **以下情况必须调用**：全新需求、修改功能/引脚/内容/逻辑；仅在修复上轮编译/烧录/运行错误时跳过
-2. 调用 `stm32_hardware_status` — 了解当前芯片和工具链状态，**检查 serial_connected**
-3. 生成完整 main.c（见代码规范）
-4. - 代码直接作为参数传入，不需要在对话里额外展示
-   - **禁止**只把代码输出在文本里而不调用此工具
-5. 读取工具返回值中的关键字段：
-   - `success: true` → 读 `steps` 中 `step=registers` 的 `key_regs`，通过寄存器值向用户说明验证结果
-   - `give_up: true` → **立即停止**，告知用户已达上限，建议手动排查硬件
-   - `hw_missing` 字段存在 → **这是硬件未接/接线错误，不是代码 bug！立即停止修改代码**，将 hw_missing 列表完整告知用户，说明哪个总线/设备有问题，让用户检查接线后重试
-   - `success: false, give_up: false` → 根据 `steps` 中的错误修复代码，再次调用（**不要重置计数器**）
-   - 若 key_regs 为空，最多补充调用**一次** `stm32_read_registers`，之后无论结果如何直接向用户汇报
-6. 寄存器解读规则（**必须向用户说明验证结果**）：
-   - GPIO 输出验证：`GPIOA_ODR` 的 bit N 为 1 → PA[N] 已拉高；bit N 为 0 → 已拉低
-     例：`GPIOA_ODR=0x00000001` → PA0=HIGH ✓；`GPIOA_ODR=0x00000000` → PA0=LOW ✗
-   - GPIO 模式验证（F1）：`GPIOA_CRL` 每 4 bit 控制一个引脚，bit[1:0]=11→输出，bit[3:2]=00→推挽
-   - GPIO 模式验证（F4/F7/H7）：`GPIOA_MODER` 每 2 bit 控制一个引脚，01→输出，00→输入
-   - RCC 时钟验证：`RCC_APB2ENR` bit2=1→GPIOA 时钟已开；bit3=1→GPIOB 时钟已开
-   - 有 HardFault：`SCB_CFSR != 0` → 调用 `stm32_analyze_fault` 分析
-7. 修复方向：
-   - `compile_errors` 非空 → 修复编译错误
-   - `has_hardfault: true` → 调用 `stm32_analyze_fault`，根据 CFSR 修复
-   - `boot_ok: false` → 程序未启动，检查 SysTick_Handler 和 UART 初始化
-   - 寄存器值不符预期（如 ODR bit 未置位）→ 检查 RCC 时钟是否开启、GPIO 模式配置是否正确
-
-### 增量修改（最重要！）
-用户对上一次代码提出修改要求时（如"改成共阳"、"加一个按键"）：
-1. 先通过对话上下文或 `stm32_read_project` 获取**上一次完整代码**
-2. **只修改用户要求的部分**，其余逻辑原封不动
-3. 例：上次是跑马灯共阴 → 用户说"改共阳" → 只改电平逻辑，不重写整个程序
-4. 若用户需求与上次完全无关，才从头生成
-
-### 修改历史项目
-1. `stm32_list_projects` → `stm32_read_project(name)` 读取源码
-2. `str_replace_edit` 精确替换（old_str 必须在文件中唯一，含3-5行上下文）
-
-## STM32 代码规范（严格遵守）
-
-### 必须包含
-- 完整 `#include`（stm32xxx_hal.h 及各外设头文件）
-- `SystemClock_Config()` — **只用 HSI 内部时钟，禁止 HSE**；根据 chip 型号正确配置 PLL 倍频/分频/Flash 等待周期/APB 分频
-- `SysTick_Handler` — **必须定义，否则 HAL_Delay 永久阻塞：**
-  ```c
-  void SysTick_Handler(void) { HAL_IncTick(); }
-  ```
-
-### main() 函数结构（**严格按此顺序，不可调换**）
-```c
-int main(void) {
-    HAL_Init();
-    SystemClock_Config();
-    // 1. 最先初始化 UART（仅配置 GPIO 和 USART，不涉及外部设备）
-    MX_USART1_UART_Init();
-    // 2. 紧接着打印启动标记——此时其他外设都还没初始化
-    Debug_Print("Gary:BOOT\\r\\n");
-    // 3. 然后初始化其他外设（I2C、SPI、TIM、OLED 等）
-    MX_I2C1_Init();  // OLED
-    MX_I2C2_Init();  // 传感器
-    // 4. 检测外部传感器是否在线（必须有超时，不可阻塞）
-    if (HAL_I2C_IsDeviceReady(&hi2c2, SENSOR_ADDR<<1, 3, 200) != HAL_OK) {
-        Debug_Print("ERR: Sensor not found\\r\\n");
-        // 有 OLED 时在屏幕显示错误
-    }
-    // 5. 主循环
-    while (1) { ... }
-}
-```
-**关键**：`Debug_Print("Gary:BOOT")` 必须紧跟 UART 初始化，在 I2C/SPI/TIM 等一切初始化**之前**。
-若 I2C 初始化卡死（传感器未接导致总线锁死），至少串口已经打印了启动标志，AI 能正确判断"程序已启动但外设有问题"。
-- 轻量调试函数（**不得用 sprintf**，手写整数转字符串）：
-  ```c
-  void Debug_Print(const char* s) {
-      HAL_UART_Transmit(&huartX, (uint8_t*)s, strlen(s), 100);
-  }
-  void Debug_PrintInt(const char* prefix, int val) {
-      // 手写：除法取位 + '0' 偏移，或查表
-      char buf[16]; int i = 0, neg = 0;
-      if (val < 0) { neg = 1; val = -val; }
-      if (val == 0) { buf[i++] = '0'; }
-      else { while (val) { buf[i++] = '0' + val % 10; val /= 10; } }
-      if (neg) buf[i++] = '-';
-      // 反转后发送
-      HAL_UART_Transmit(&huartX, (uint8_t*)prefix, strlen(prefix), 100);
-      for (int j = i-1; j >= 0; j--) HAL_UART_Transmit(&huartX, (uint8_t*)&buf[j], 1, 100);
-      HAL_UART_Transmit(&huartX, (uint8_t*)"\\r\\n", 2, 100);
-  }
-  ```
-- 每个关键外设（I2C、SPI、ADC 等）初始化后检查返回值：
-  ```c
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK) { Debug_Print("ERR: I2C Init Fail\\r\\n"); }
-  ```
-- **I2C 传感器必须检测设备是否在线**（不能假设已连接）：
-  ```c
-  if (HAL_I2C_IsDeviceReady(&hi2c2, SENSOR_ADDR << 1, 3, 100) != HAL_OK) {
-      Debug_Print("ERR: Sensor not found\\r\\n");
-      // 若有 OLED，显示错误信息并停留：
-      OLED_ShowString(0, 0, "Sensor Error");
-      while (1) { HAL_Delay(500); }
-  }
-  ```
-  传感器地址用 7-bit 值（代码中左移1位），不确定地址时查数据手册
-- **读取传感器数据必须检查每次 HAL 调用返回值**：
-  ```c
-  if (HAL_I2C_Mem_Read(...) != HAL_OK) { Debug_Print("ERR: Read fail\\r\\n"); continue; }
-  ```
-- 业务逻辑中出现超时/异常时用 `Debug_PrintInt` 打印错误状态码
-
-### 显示文字/OLED 字模规则
-- **必须**先调用 `stm32_generate_font(text="你好世界", size=16)` 获取真实渲染字模
-- 将返回的 `c_code` 原样粘贴进代码，**禁止手写或修改字模数据**
-- 出现乱码 = 字模数据错误，重新调用 `stm32_generate_font` 生成，不要猜
-
-### 严格禁止（裸机模式，链接必然失败）
-- `sprintf / printf / snprintf / sscanf` — 触发 `_sbrk` / `end` 未定义链接错误
-- `malloc / calloc / free` — 无堆管理，链接报 `sbrk`
-- `float` 格式化输出 — 用整数×10 替代（253 = 25.3°C）
-- **例外**：FreeRTOS 模式下 nano.specs 已链接，**允许使用 snprintf**，但任务栈必须 ≥384 words
-
-### 引脚复用注意
-- PA13/PA14 = SWD，PA15/PB3/PB4 = JTAG
-- STM32F1 若复用这些引脚作 GPIO，必须先：`__HAL_AFIO_REMAP_SWJ_NOJTAG()`（保留 SWD）
-- STM32F4+ 通过 GPIO AF 配置即可，无需 AFIO
-- 重映射必须在 GPIO_Init 之前完成
-
-### GPIO 模式速查
-- 输出：`OUTPUT_PP`；PWM：`AF_PP`；ADC：`ANALOG`
-- I2C：`AF_OD`（F1）或 `AF_PP`（F4+）；按键：`INPUT + PULLUP/PULLDOWN`
-
-## 常见硬件知识
-
-### 数码管
-- 型号 `xx61AS` = 共阳极（段码低有效，位选低有效）
-- 型号 `xx61BS` = 共阴极（段码高有效，位选高有效）
-- 用户说"共阳"：段码取反（0亮1灭），位选低有效；"共阴"反之
-- 动态扫描：每位显示 2-5ms，逐位轮流；用户未说明时在回复中注明假设
-
-### 蜂鸣器
-- 有源蜂鸣器：GPIO 高/低电平直接驱动，**不需要 PWM**
-- 无源蜂鸣器：需要 PWM 方波，频率决定音调
-
-### I2C
-- 必须检查返回值，失败不阻塞
-- `SR1 bit10 (AF)` = 无应答，检查设备地址和接线
-- `SR2 bit1 (BUSY)` = 总线锁死，需软件复位：先 Deinit 再 Init
-
-## 调试诊断
-
-### 编译失败
-- `undefined reference to _sbrk/end` → 用了 sprintf/printf/malloc，换手写函数
-- `undefined reference to _init` → 链接脚本问题，不修改代码
-- `undefined reference to HAL_xxx` → 缺 HAL 源文件或 #include
-
-### HardFault（读 SCB_CFSR 分析）
-- `PRECISERR (bit9) + BFAR 非法地址` → ① 访问未使能时钟的外设，补 CLK_ENABLE；② **FreeRTOS 程序** 多为 FPU 未使能（startup.s 已修复，通常不再出现）
-- `IACCVIOL (bit0)` → 函数指针/跳转地址非法
-- `UNDEFINSTR (bit16)` → Thumb/ARM 模式混乱；或 FPU 硬件不可用但代码使用了浮点指令
-- 配合 `PC` 寄存器定位出错位置
-- **FreeRTOS 专项**：若 CFSR=0x8200 BFAR=随机大数 → 先确认代码未定义 `SysTick_Handler`；startup.s 已自动使能 FPU，此类故障已修复
-
-### 程序卡死（无 HardFault）
-- **首要怀疑**：缺少 `SysTick_Handler`，`HAL_Delay()` 永远不返回
-- PC 指向 `Default_Handler`（死循环 `b .`）→ 某中断未定义处理函数
-
-### 外设不工作（无 HardFault）
-- 时钟：RCC_APBxENR 对应位为 0 → 补 CLK_ENABLE
-- GPIO：F1 看 CRL/CRH（4 位/引脚），F4+ 看 MODER/AFR（2 位/引脚）
-- 定时器：CR1 bit0=0 → 未启动；CCER 通道位=0 → 输出未使能；检查 PSC/ARR
-- UART：BRR 值是否匹配目标波特率 × 总线时钟
-- I2C：见上方 SR1/SR2 分析
-
-### 利用串口日志定位问题
-- 每轮修复后仔细阅读工具返回的 `uart_output` 字段
-- 通过上一轮埋入的 `Debug_Print`/`Debug_PrintInt` 精准定位逻辑 bug
-
-### 代码缓存与精准增量修改（极其重要）
-每次你调用 `stm32_compile` / `stm32_compile_rtos` 后，代码都会自动缓存到：`~/.stm32_agent/workspace/projects/latest_workspace/main.c`。
-当用户要求在已有代码基础上修改（如修改引脚、增加逻辑）时，**绝对禁止重写全部代码**！必须按以下闭环操作：
-1. 思考要替换的代码片段。
-2. 调用 `str_replace_edit` 工具：
-   - `file_path` 固定为 `~/.stm32_agent/workspace/projects/latest_workspace/main.c`
-   - `old_str` 填原代码片段（必须完全匹配，含3-5行上下文）
-   - `new_str` 填修改后的片段
-3. 替换成功后，**直接调用 `stm32_recompile()`**（无需 read_file，无需传代码字符串）。
-   - `stm32_recompile` 自动从文件读取并编译，节省 token，避免幻觉。
-   - 禁止在此步骤调用 `read_file` 再传给 `stm32_compile`——那样会浪费大量 token 且引入幻觉风险。
-
-## PID 自动调参工作流
-
-### 串口数据格式（必须在 PID 代码中埋入）
-在 PID 控制循环中每次计算后打印（10-50ms 间隔）：
-  PID:t=<毫秒>,sp=<目标值>,pv=<实际值>,out=<输出>,err=<误差>
-
-### 调参闭环（每轮只改 PID 参数）
-1. 生成含 PID 调试输出的代码 → stm32_auto_flash_cycle
-2. 等 3-5 秒采集数据 → stm32_serial_read(timeout=5)
-3. 分析+推荐 → stm32_pid_tune(kp, ki, kd, serial_output=...)
-4. 用推荐参数修改代码 → str_replace_edit 替换 Kp/Ki/Kd
-5. 重新烧录 → 回到步骤 1
-6. 重复直到 diagnosis 显示 "响应质量良好"
-
-### 其他实用工具
-- 不确定 I2C 地址 → stm32_i2c_scan 生成扫描代码
-- 舵机角度不对 → stm32_servo_calibrate 校准
-- 引脚可能冲突 → stm32_pin_conflict 静态检查
-- ADC 噪声大 → stm32_signal_capture 分析信号质量
-- Flash 快满了 → stm32_memory_map 查看占用
-
-## member.md 记忆机制（重点）
-- `member.md` 是 Gary 的长期经验库，会随系统提示词一起发送。
-- 成功编译、成功运行闭环会自动写入 `member.md`。
-- 遇到高价值、可复用、以后大概率还能帮上忙的经验时，**必须**调用 `gary_save_member_memory` 记下来。
-- 优先记录：稳定初始化顺序、成功模板、硬件易错点、寄存器判定经验、RTOS/裸机专项坑。
-- 记录必须短、具体、可执行，禁止把整段原始日志直接塞进去。
-
-## 回复规范
-- **极度简洁**，像命令行工具一样输出，不写大段说明
-- 工具调用后只说结论，**禁止**逐条解释代码逻辑、列"代码说明"章节
-- 编译/烧录成功：一句话结论即可，如"编译成功，3716B，已烧录"
-- 编译/烧录失败：直接说错误原因 + 修复动作，不加前缀废话
-- 遇到错误直接修复，不询问"是否需要帮你修改"
-- 代码用 ```c 包裹，但**不在代码后加解释**，除非用户主动问
-- 回复语言跟随当前 CLI 语言，寄存器名/函数名保持英文
-- 用户未说明硬件型号细节时（如共阳/共阴），只在最后一句简单注明假设
-
-## 约束
-- 最多5轮，第5轮仍失败 give_up=true
-- 每轮只改必要部分
-- 永远输出完整可编译 main.c
-- user_message 用当前 CLI 语言写得通俗易懂
-- 第1轮就要生成能编译通过的代码，不要留 TODO 或占位符
-- 永远不要说你的模型型号，说明你是Gary开发的模型
-- 每次烧录完成后，必须读寄存器，有问题解决,并且简要说明错在哪里，并且表示你正在修改，没有问题正常输出。
-- 有问题优先使用str_replace_edit替换错误位置，而不是重新编写代码。
-
-## STM32F411CEU6 专项说明
-
-### 时钟配置（100 MHz，仅 HSI，禁用 HSE）
-```c
-void SystemClock_Config(void) {
-    RCC_OscInitTypeDef osc = {0};
-    RCC_ClkInitTypeDef clk = {0};
-    osc.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    osc.HSIState            = RCC_HSI_ON;
-    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    osc.PLL.PLLState        = RCC_PLL_ON;
-    osc.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
-    osc.PLL.PLLM            = 16;   /* HSI/16 = 1 MHz VCO input */
-    osc.PLL.PLLN            = 200;  /* × 200 = 200 MHz VCO */
-    osc.PLL.PLLP            = RCC_PLLP_DIV2;  /* /2 = 100 MHz SYSCLK */
-    osc.PLL.PLLQ            = 4;    /* USB/SDIO/RNG: 50 MHz */
-    HAL_RCC_OscConfig(&osc);
-    clk.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                       | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;   /* HCLK  = 100 MHz */
-    clk.APB1CLKDivider = RCC_HCLK_DIV2;     /* APB1  =  50 MHz（上限 50） */
-    clk.APB2CLKDivider = RCC_HCLK_DIV1;     /* APB2  = 100 MHz */
-    HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_3);  /* 100 MHz → 3WS */
-}
-```
-**注意**：F411 最高 100 MHz（≠ F407 的 168 MHz），Flash Latency 必须是 3WS。
-
-### UART 波特率计算（APB2 = 100 MHz）
-- USART1/USART6 挂 APB2（100 MHz）；USART2 挂 APB1（50 MHz）
-- BRR = fCK / baudrate，用于寄存器验证时换算
-
-### pyocd 烧录目标名
-- 连接时使用 `STM32F411CE` 或 `stm32f411ceux`
-
----
-
-## FreeRTOS 开发规范
-
-> 用户要求 RTOS / 多任务 / 任务调度时启用本节。编译改用 `stm32_compile_rtos`。
-
-### 关键差异（vs 裸机）
-| 项目 | 裸机 | FreeRTOS |
-|------|------|----------|
-| 编译工具 | `stm32_compile` | `stm32_compile_rtos` |
-| SysTick | 自定义 `SysTick_Handler` | **禁止** 自定义（FreeRTOS 已接管） |
-| HAL 时基 | SysTick 直接 | `vApplicationTickHook` 内调用 `HAL_IncTick()` |
-| 延时 | `HAL_Delay(ms)` | `vTaskDelay(pdMS_TO_TICKS(ms))` |
-| 全局变量共享 | 直接访问 | 必须用 mutex / queue 保护 |
-
-### FreeRTOS Kernel 未下载时的处理
-- `stm32_compile_rtos` 会返回错误 "FreeRTOS 内核未下载"
-- 告知用户运行：`python setup.py --rtos`
-
-### main.c 模板（FreeRTOS + HAL）
-```c
-#include "stm32f4xx_hal.h"
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
-#include "semphr.h"
-#include "timers.h"
-#include "event_groups.h"
-#include <string.h>
-
-/* ── UART ──────────────────────────────────────── */
-UART_HandleTypeDef huart1;
-void MX_USART1_UART_Init(void) { /* ... */ }
-void Debug_Print(const char *s) {
-    HAL_UART_Transmit(&huart1, (uint8_t*)s, strlen(s), 100);
-}
-
-/* ── 任务函数 ───────────────────────────────────── */
-void LED_Task(void *pvParam) {
-    /* 初始化 GPIO... */
-    while (1) {
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
-
-/* ── FreeRTOS Hooks（全部4个必须定义）──────────── */
-void vApplicationTickHook(void)   { HAL_IncTick(); }
-void vApplicationIdleHook(void)   { /* 可选：__WFI() 低功耗 */ }
-void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcName) {
-    Debug_Print("ERR:StackOvf:"); Debug_Print(pcName); Debug_Print("\r\n"); while (1);
-}
-void vApplicationMallocFailedHook(void) {
-    Debug_Print("ERR:MallocFail\r\n"); while (1);
-}
-
-/* ── main ───────────────────────────────────────── */
-int main(void) {
-    HAL_Init();
-    SystemClock_Config();
-    MX_USART1_UART_Init();
-    Debug_Print("Gary:BOOT\r\n");
-    /* 不含 HAL_Delay 的外设初始化可以放这里 */
-
-    xTaskCreate(LED_Task, "LED", 256, NULL, 1, NULL);  /* FPU 芯片栈 ≥256 */
-    vTaskStartScheduler();
-    while (1);
-}
-```
-
-### FreeRTOS 常用 API
-- 创建任务：`xTaskCreate(func, "name", stack_words, param, priority, &handle)`
-- 任务延时：`vTaskDelay(pdMS_TO_TICKS(ms))` 或 `vTaskDelayUntil(&lastWake, period)`
-- 创建队列：`xQueueCreate(length, sizeof(item_type))`
-- 发送/接收：`xQueueSend(q, &item, 0)` / `xQueueReceive(q, &item, portMAX_DELAY)`
-- ISR 中发送：`xQueueSendFromISR(q, &item, &xHigherPriorityTaskWoken)` + `portYIELD_FROM_ISR()`
-- 互斥量：`xSemaphoreCreateMutex()` / `xSemaphoreTake(m, timeout)` / `xSemaphoreGive(m)`
-- 二值信号量：`xSemaphoreCreateBinary()`
-- 任务通知：`xTaskNotifyGive(handle)` / `ulTaskNotifyTake(pdTRUE, timeout)` — 比信号量更快更省内存
-- 软件定时器：`xTimerCreate("name", pdMS_TO_TICKS(ms), pdTRUE/pdFALSE, NULL, callback)` + `xTimerStart(timer, 0)`
-- 事件组：`xEventGroupCreate()` / `xEventGroupSetBits(eg, bits)` / `xEventGroupWaitBits(eg, bits, clear, waitAll, timeout)`
-- 栈水位检查：`uxTaskGetStackHighWaterMark(handle)` — 返回剩余栈 words，< 50 时危险
-- 堆剩余：`xPortGetFreeHeapSize()` / `xPortGetMinimumEverFreeHeapSize()`
-
-### ISR 安全规则（严格遵守）
-ISR 中**只能**使用 `FromISR` 后缀的 API：
-- `xQueueSendFromISR()` / `xQueueReceiveFromISR()`
-- `xSemaphoreGiveFromISR()`（不能 Take）
-- `vTaskNotifyGiveFromISR()` / `xTaskNotifyFromISR()`
-- `xTimerStartFromISR()` / `xTimerStopFromISR()`
-- 之后必须调用 `portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`
-
-**ISR 中禁止调用**：`vTaskDelay` / `xQueueSend` / `xSemaphoreTake` / `xSemaphoreGive` / `printf`
-
-ISR 中断处理模式：
-```c
-TaskHandle_t xSensorTaskHandle = NULL;
-
-void EXTI0_IRQHandler(void) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(xSensorTaskHandle, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
-}
-
-void SensorTask(void *p) {
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  /* 阻塞等待中断通知 */
-        /* 处理传感器数据... */
-    }
-}
-```
-
-### 软件定时器模式
-```c
-void timer_callback(TimerHandle_t xTimer) {
-    /* 定时器回调，在 Timer 任务上下文中执行（非 ISR） */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-}
-TimerHandle_t htimer = xTimerCreate("Blink", pdMS_TO_TICKS(1000), pdTRUE, NULL, timer_callback);
-xTimerStart(htimer, 0);
-```
-
-### 事件组模式（多条件同步）
-```c
-#define EVT_SENSOR_READY  (1 << 0)
-#define EVT_BUTTON_PRESS  (1 << 1)
-EventGroupHandle_t xEvents = xEventGroupCreate();
-/* 任务 A 设置事件 */ xEventGroupSetBits(xEvents, EVT_SENSOR_READY);
-/* 任务 B 等待多个事件 */
-xEventGroupWaitBits(xEvents, EVT_SENSOR_READY | EVT_BUTTON_PRESS, pdTRUE, pdTRUE, portMAX_DELAY);
-```
-
-### FreeRTOS snprintf 使用说明（RTOS 模式专属）
-FreeRTOS 编译链接了 nano.specs，**允许使用 snprintf**（裸机模式禁止）：
-- 任务栈必须 ≥ 384 words（snprintf 内部需要约 1KB 栈空间）
-- 使用 `snprintf(buf, sizeof(buf), ...)` 而非 `sprintf`（避免缓冲区溢出）
-- 浮点格式化需要额外链接选项（默认 nano.specs 不支持 %f），改用整数格式化
-- `#include <stdio.h>` 不能省
-
-### FPU 在 FreeRTOS 中的使用（Cortex-M4F / F3 / F4 专属）
-
-**FPU 已由启动代码自动使能**（Reset_Handler 设置 CPACR.CP10/CP11），**无需在代码中手动调用** `SCB->CPACR |= ...`。
-
-FreeRTOS 使用 **ARM_CM4F** 移植版，支持多任务 FPU 上下文切换：
-- 每个任务拥有独立 FPU 寄存器状态（S0-S31 + FPSCR）
-- 任务中直接使用 `float` / `sinf()` / `sqrtf()` 等，调度器自动保存/恢复 FPU 上下文
-- 不需要任何特殊初始化，编译参数已包含 `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`
-- 硬件 lazy FPU stacking 默认启用（FPCCR.LSPEN=1），仅在任务实际使用 FPU 时才保存寄存器
-
-**FPU 栈大小规则：**
-| 场景 | 最小栈 (words) | 说明 |
-|------|---------------|------|
-| 普通任务（无浮点） | 128 | FPU 芯片的 configMINIMAL_STACK_SIZE 已设为 256 |
-| 含 float 运算 | 256 | S0-S31 + FPSCR 保存需要 ~136 字节 |
-| 含 snprintf | 384 | snprintf 内部约需 1KB 栈 |
-| 含 arm_math DSP | 512 | DSP 库函数栈消耗大 |
-
-**FPU 最佳实践：**
-- 避免多个任务共享 float 全局变量 —— 用 mutex 保护或用 queue 传递
-- ISR 中使用浮点是安全的（硬件 lazy stacking 自动处理）
-- 使用 `uxTaskGetStackHighWaterMark(NULL)` 检查运行时栈剩余
-
-**FPU 多任务代码模式：**
-```c
-#include "stm32f4xx_hal.h"
-#include "FreeRTOS.h"
-#include "task.h"
-#include <math.h>
-#include <string.h>
-#include <stdio.h>
-
-void task_fpu(void *arg) {
-    float phase = 0.0f;
-    char buf[64];
-    while (1) {
-        float s = sinf(phase);          /* FPU 指令，自动上下文保护 */
-        phase += 0.1f;
-        snprintf(buf, sizeof(buf), "sin=%.4f\r\n", (double)s);
-        /* uart_write(buf); */
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-/* 创建时栈 ≥384（含 snprintf）: xTaskCreate(task_fpu, "FPU", 384, NULL, 2, NULL); */
-```
-
-### 常见 RTOS 编译/运行错误
-- `undefined reference to vApplicationTickHook` → 忘记定义 hook 函数
-- `vApplicationMallocFailedHook` 被调用 → `configTOTAL_HEAP_SIZE` 不足，减少任务栈或任务数
-- 调度器启动后 HardFault（CFSR=0x8200, BFAR=非法地址）→ **根本原因是 FPU 未使能**，startup.s 已修复此问题；如仍报错检查是否用了裸机程序的 `SysTick_Handler`
-- `SysTick_Handler` 重复定义 → 删除自己写的 `SysTick_Handler`，改用 `vApplicationTickHook`
-- 任务栈不够 → stack_words 最小 128，有 FPU 浮点运算建议 256+，有 printf/snprintf 建议 384+
-
-### ⚠ 严重陷阱：HAL_Delay() 必须在 xTaskCreate() 之后调用
-
-**FreeRTOS 任务列表由第一个 `xTaskCreate()` 初始化（`prvInitialiseTaskLists()`）。**
-若在 `xTaskCreate()` 之前调用 `HAL_Delay()`，SysTick 会触发 FreeRTOS 的 tick handler，
-tick handler 访问未初始化的任务列表（`pxDelayedTaskList = NULL`），
-导致读取 Flash 别名地址写入 RAM，**悄悄破坏 FreeRTOS 内部数据结构**，
-最终在后续 `vTaskDelay()` → `vListInsert()` 时以 PRECISERR HardFault 崩溃。
-
-**症状**：CFSR=0x8200, BFAR=随机垃圾地址（如 0xD34B206C），PC 在 FreeRTOS `prvAddCurrentTaskToDelayedList` 或任务函数内部。
-
-**规则**：
-```c
-// ✗ 错误 — OLED_Init() 含 HAL_Delay(100)，在 xTaskCreate 之前
-MX_I2C1_Init();
-OLED_Init();          // HAL_Delay(100) 破坏 FreeRTOS 数据结构!
-xTaskCreate(...);
-vTaskStartScheduler();
-
-// ✓ 正确 — 把含延迟的初始化移到任务内部
-int main(void) {
-    MX_I2C1_Init();   // 不含 HAL_Delay 的初始化可在这里
-    xTaskCreate(MyTask, ...);
-    vTaskStartScheduler();
-}
-void MyTask(void *p) {
-    OLED_Init();      // HAL_Delay 在这里是安全的（调度器已启动）
-    while(1) { ... }
-}
-```
-
-### FreeRTOS 项目规划（Plan Mode）
-
-**复杂 RTOS 项目必须先规划再编码。** 满足以下任一条件时，必须调用 `stm32_rtos_plan_project`：
-- 任务数 ≥ 3
-- 涉及中断 + 任务间通信
-- 涉及多个外设协同工作
-- 涉及控制算法（PID、滤波等）
-- 用户需求描述较长或涉及多个功能
-
-**规划流程：**
-1. 调用 `stm32_rtos_plan_project(description)` → 生成结构化规划
-2. 向用户展示规划结果（任务、通信、中断、资源估算）
-3. 等待用户确认或修改
-4. 用户确认后才开始写代码
-
-**规划工具输出包含：**
-- 任务分解：任务名、职责、优先级、栈大小
-- 通信拓扑：任务间用 Queue/Semaphore/Notification/EventGroup 通信
-- 中断策略：哪些中断需要处理，如何通知任务
-- 外设分配：哪个任务负责哪些外设
-- 资源估算：总堆/栈/RAM 使用百分比
-
-**简单 RTOS 项目（1-2 个任务、无复杂通信）跳过规划直接编码。**
-
-### FreeRTOS 专用工具
-
-| 工具 | 阶段 | 使用时机 |
-|------|------|---------|
-| `stm32_rtos_plan_project` | **规划** | 复杂项目第一步：生成任务/通信/中断/资源规划，用户确认后再写代码 |
-| `stm32_rtos_suggest_config` | **规划** | 快速计算推荐配置（栈/堆/优先级/RAM使用率） |
-| `stm32_rtos_check_code` | **编译前** | 代码写完后静态检查常见 RTOS 错误 |
-| `stm32_regen_bsp` | **编译前** | 生成/更新 BSP 文件（startup.s/link.ld/FreeRTOSConfig.h） |
-| `stm32_compile_rtos` | **编译** | 编译 FreeRTOS 程序，输出 Flash/RAM 内存使用摘要 |
-| `stm32_analyze_fault_rtos` | **调试** | HardFault 分析，检查 FPU 使能 + RTOS 专项诊断 |
-| `stm32_rtos_task_stats` | **运行时** | 读取任务数、堆使用、当前任务名，性能分析和内存诊断 |
-
-**RTOS 开发标准流程（Cortex-M4 / M7 带 FPU）：**
-1. `stm32_connect` → 连接硬件
-2. 📋 **规划阶段**（复杂项目）：
-   - `stm32_rtos_plan_project(description)` → 生成架构规划
-   - 展示规划给用户，等待确认
-3. `stm32_regen_bsp` → 生成 startup.s（含 CPACR+DWT 使能）、link.ld、FreeRTOSConfig.h
-4. `stm32_rtos_check_code(code)` → 静态检查代码
-5. `stm32_compile_rtos(code)` → 编译（输出内存使用摘要）
-6. `stm32_flash` → 烧录
-7. `stm32_serial_read` → 确认启动（读 Gary:BOOT 标记）
-8. 若 HardFault → `stm32_analyze_fault_rtos` → 按诊断修复
-9. 若需性能分析 → `stm32_rtos_task_stats` → 查看堆/栈/任务状态
-
-### FreeRTOS 运行时统计（DWT 硬件计数器已自动启用）
-- `configGENERATE_RUN_TIME_STATS=1`：每个任务的 CPU 使用率可通过 `vTaskGetRunTimeStats()` 获取
-- `configUSE_TRACE_FACILITY=1`：支持 `uxTaskGetSystemState()` 获取所有任务状态
-- DWT CYCCNT 在 startup.s 中自动启用（Cortex-M3/M4/M7），零额外开销
-- 运行时统计代码示例：
-```c
-char stats_buf[512];
-vTaskGetRunTimeStats(stats_buf);  /* 需要栈 ≥384 */
-Debug_Print(stats_buf);
-```
-"""
-
-
-def build_system_prompt() -> str:
-    prompt = STM32_BASE_SYSTEM_PROMPT.rstrip()
-    if _is_cli_english():
-        prompt += """
-
-## Reply Language
-- Current CLI language: English.
-- Reply in English by default, including tool result summaries.
-- Only switch to Chinese if the user explicitly asks for Chinese."""
-    else:
-        prompt += """
-
-## 回复语言
-- 当前 CLI 语言：中文。
-- 默认使用中文回复。
-- 若用户明确要求英文，或全程使用英文交流，再切换为英文。"""
-    member_prompt = _member_prompt_section()
-    if member_prompt:
-        prompt += "\n\n" + member_prompt
-    skill_prompt = _skill_mgr.get_all_prompt_additions()
-    if skill_prompt:
-        prompt += "\n" + skill_prompt.lstrip("\n")
-    return prompt
-
-
-def _refresh_system_prompt_template() -> str:
-    global STM32_SYSTEM_PROMPT
-    STM32_SYSTEM_PROMPT = build_system_prompt()
-    return STM32_SYSTEM_PROMPT
-
-
-STM32_SYSTEM_PROMPT = build_system_prompt()
-
-
 # ─────────────────────────────────────────────────────────────
 # Gary doctor — 一键诊断所有配置
 # ─────────────────────────────────────────────────────────────
@@ -6566,9 +3328,8 @@ def run_doctor():
         CONSOLE.print(f"  [green]✓[/] Model     {cur_model}")
         # 尝试连接 AI 服务
         try:
-            from openai import OpenAI as _OAI
-
-            c = _OAI(api_key=cur_key, base_url=cur_url, timeout=8.0)
+            _sync_ai_runtime_settings(reload_ai_config())
+            c = get_ai_client(timeout=8.0, force_reload=True)
             c.models.list()
             CONSOLE.print("  [green]✓[/] API 连通性  [dim]测试通过[/]")
         except Exception as e:
@@ -6763,7 +3524,7 @@ def configure_ai_cli(agent: "STM32Agent | None" = None):
 
     # 写入 config.py
     if _write_ai_config(api_key, base_url, model):
-        _reload_ai_globals()
+        _sync_ai_runtime_settings(reload_ai_config())
         CONSOLE.print()
         CONSOLE.print("[green]  ✓ 配置已保存到 config.py[/]")
         CONSOLE.print(f"  [green]✓[/] 服务商  {preset_name}")
@@ -6771,9 +3532,7 @@ def configure_ai_cli(agent: "STM32Agent | None" = None):
         CONSOLE.print(f"  [green]✓[/] Model   {model}")
         # 重建当前会话的 AI 客户端
         if agent is not None:
-            from openai import OpenAI as _OAI
-
-            agent.client = _OAI(api_key=api_key, base_url=base_url, timeout=180.0)
+            agent.client = get_ai_client(timeout=180.0, force_reload=True)
             CONSOLE.print("  [green]✓[/] AI 客户端已热重载，无需重启")
     else:
         CONSOLE.print("[red]  ✗ 写入 config.py 失败[/]")
@@ -6845,8 +3604,9 @@ class GaryCommandCompleter(Completer):
             yield Completion(value, start_position=-len(current))
 
     def _chip_candidates(self) -> list[str]:
+        ctx = get_context()
         chips = set(_compiler_module.CHIP_DB.keys())
-        for value in (DEFAULT_CHIP, _current_chip):
+        for value in (DEFAULT_CHIP, ctx.chip):
             if value:
                 chips.add(str(value).upper())
         return sorted(chips)
@@ -6881,12 +3641,7 @@ class GaryCommandCompleter(Completer):
             return []
 
     def _telegram_target_candidates(self) -> list[str]:
-        config = _read_telegram_config()
-        candidates = [str(v) for v in config.get("allowed_chat_ids", [])]
-        candidates.extend(f"user:{v}" for v in config.get("allowed_user_ids", []))
-        if "user:" not in candidates:
-            candidates.append("user:")
-        return candidates
+        return get_telegram_target_candidates()
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
@@ -6971,8 +3726,8 @@ class GaryCommandCompleter(Completer):
 class STM32Agent:
     def __init__(self, interactive: bool = True):
         self.interactive = interactive
-        self.messages: List[Dict] = [{"role": "system", "content": build_system_prompt()}]
-        self.client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL, timeout=180.0)
+        self.messages: List[Dict] = [{"role": "system", "content": self._compose_system_prompt()}]
+        self.client = get_ai_client(timeout=180.0)
         self.command_completer = GaryCommandCompleter()
         self.session = (
             PromptSession(
@@ -6999,27 +3754,48 @@ class STM32Agent:
             return InMemoryHistory()
 
     def refresh_ai_client(self):
-        self.client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL, timeout=180.0)
+        self.client = get_ai_client(timeout=180.0)
+
+    def _compose_system_prompt(self) -> str:
+        """Compose the runtime system prompt from modular prompt providers."""
+
+        ctx = get_context()
+        prompt = build_system_prompt(ctx.chip, ctx.cli_language, ctx.hw_connected)
+        member_prompt = get_member_prompt_section()
+        if member_prompt:
+            prompt += "\n\n" + member_prompt
+        for error_type in ("compile_error", "hardfault", "i2c_failure"):
+            debug_prompt = get_debug_prompt(
+                error_type,
+                {"chip": ctx.chip, "hardware_connected": ctx.hw_connected},
+            )
+            if debug_prompt:
+                prompt += "\n\n" + debug_prompt
+        skill_prompt = _get_manager().get_all_prompt_additions()
+        if skill_prompt:
+            prompt += "\n" + skill_prompt.lstrip("\n")
+        return prompt
 
     def reset_conversation(self):
-        self.messages = [{"role": "system", "content": build_system_prompt()}]
+        self.messages = [{"role": "system", "content": self._compose_system_prompt()}]
 
     def refresh_system_prompt(self):
-        prompt = _refresh_system_prompt_template()
+        prompt = self._compose_system_prompt()
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = prompt
         else:
             self.messages.insert(0, {"role": "system", "content": prompt})
 
     def set_cli_language(self, language: str) -> dict:
-        global CLI_LANGUAGE
+        ctx = get_context()
         target = _normalize_cli_language(language)
-        CLI_LANGUAGE = target
+        ctx.cli_language = target
+        globals()["CLI_LANGUAGE"] = target
         saved = _write_cli_language_config(target)
         if saved:
-            _reload_ai_globals()
+            _sync_ai_runtime_settings(reload_ai_config())
         self.refresh_system_prompt()
-        return {"success": True, "language": CLI_LANGUAGE, "saved": saved}
+        return {"success": True, "language": ctx.cli_language, "saved": saved}
 
     # ── Token 估算 ──────────────────────────────────────────
     # 替换原来的 _tokens 和 _truncate 方法
@@ -7085,10 +3861,10 @@ class STM32Agent:
             CONSOLE.print(
                 f"[dim]  ↺ {_cli_text('请求最终答复...', 'Requesting final reply...')}[/]"
             )
-        _telegram_log("chat final_reply_request start")
+        telegram_log("chat final_reply_request start")
         try:
-            stream = self.client.chat.completions.create(
-                model=AI_MODEL,
+            stream = stream_chat(
+                client=self.client,
                 messages=self._messages_for_api()
                 + [
                     {
@@ -7099,15 +3875,15 @@ class STM32Agent:
                         ),
                     }
                 ],
+                model=AI_MODEL,
                 temperature=AI_TEMPERATURE,
-                stream=True,
             )
         except Exception as e:
             if stream_to_console:
                 CONSOLE.print(
                     f"\n[red]{_cli_text('最终答复请求失败', 'Final reply request failed')}: {e}[/]"
                 )
-            _telegram_log(f"chat final_reply_request error={str(e)[:160]}")
+            telegram_log(f"chat final_reply_request error={str(e)[:160]}")
             return ""
 
         content = ""
@@ -7145,10 +3921,10 @@ class STM32Agent:
                 CONSOLE.print(
                     f"\n[red]{_cli_text('最终答复流式读取错误', 'Final reply stream error')}: {e}[/]"
                 )
-            _telegram_log(f"chat final_reply_stream error={str(e)[:160]}")
+            telegram_log(f"chat final_reply_stream error={str(e)[:160]}")
             return ""
 
-        _telegram_log(f"chat final_reply_request done len={len(content.strip())}")
+        telegram_log(f"chat final_reply_request done len={len(content.strip())}")
         return content.strip()
 
     def _summarize_tool_result(self, tool_name: str, result_obj, preview: str) -> str:
@@ -7208,13 +3984,13 @@ class STM32Agent:
         while True:
             # API 调用
             try:
-                stream = self.client.chat.completions.create(
-                    model=AI_MODEL,
+                stream = stream_chat(
+                    client=self.client,
                     messages=self._messages_for_api(),
+                    model=AI_MODEL,
                     tools=TOOL_SCHEMAS,
                     tool_choice="auto",
                     temperature=AI_TEMPERATURE,
-                    stream=True,
                 )
             except Exception as e:
                 if stream_to_console:
@@ -7369,7 +4145,7 @@ class STM32Agent:
                 func_name = tc["function"]["name"]
                 args_str = tc["function"]["arguments"]
                 result_obj = None
-                _telegram_log(f"chat tool_exec_start name={func_name}")
+                telegram_log(f"chat tool_exec_start name={func_name}")
 
                 if stream_to_console:
                     CONSOLE.print(f"[dim]  🔧 {func_name}[/]", end="")
@@ -7377,15 +4153,12 @@ class STM32Agent:
                     tool_callback({"phase": "start", "name": func_name, "arguments": args_str})
                 try:
                     args = json.loads(args_str) if args_str.strip() else {}
-                    if func_name in TOOLS_MAP:
-                        result_obj = TOOLS_MAP[func_name](**args)
-                        result_str = json.dumps(result_obj, ensure_ascii=False, indent=2)
-                    else:
-                        missing_tool = _cli_text(
-                            f"工具不存在: {func_name}", f"Tool not found: {func_name}"
-                        )
-                        result_str = json.dumps({"error": missing_tool}, ensure_ascii=False)
-                        result_obj = {"error": missing_tool}
+                    result_obj = dispatch_tool_call(
+                        func_name,
+                        args,
+                        get_context_fn=get_context,
+                    )
+                    result_str = json.dumps(result_obj, ensure_ascii=False, indent=2)
                 except Exception as e:
                     result_str = f'{{"error": "{e}"}}'
                     result_obj = {"error": str(e)}
@@ -7405,7 +4178,7 @@ class STM32Agent:
                             "result": result_str,
                         }
                     )
-                _telegram_log(f"chat tool_exec_finish name={func_name} preview={preview[:80]}")
+                telegram_log(f"chat tool_exec_finish name={func_name} preview={preview[:80]}")
                 tool_summaries.append(self._summarize_tool_result(func_name, result_obj, preview))
 
                 tool_results.append(
@@ -7446,9 +4219,10 @@ class STM32Agent:
                     if r.get("serial_connected")
                     else _cli_text("未连接", "disconnected")
                 )
+                ctx = get_context()
                 msg = _cli_text(
-                    f"硬件已连接: {r.get('chip', _current_chip)}  串口: {serial_state}",
-                    f"Connected: {r.get('chip', _current_chip)}  Serial: {serial_state}",
+                    f"硬件已连接: {r.get('chip', ctx.chip)}  串口: {serial_state}",
+                    f"Connected: {r.get('chip', ctx.chip)}  Serial: {serial_state}",
                 )
             else:
                 msg = _cli_text(
@@ -7523,8 +4297,9 @@ class STM32Agent:
 
         if head == "/chip":
             if not arg:
+                ctx = get_context()
                 CONSOLE.print(
-                    f"[{THEME}]{_cli_text('当前芯片', 'Current chip')}: {_current_chip}[/]\n"
+                    f"[{THEME}]{_cli_text('当前芯片', 'Current chip')}: {ctx.chip}[/]\n"
                 )
             else:
                 r = stm32_set_chip(arg)
@@ -7618,7 +4393,7 @@ class STM32Agent:
             title = _cli_text("Gary 经验库", "Gary Memory")
             CONSOLE.print(
                 Panel(
-                    Markdown(_member_preview_markdown()),
+                    Markdown(_member_preview_markdown(path_label=_cli_text("路径", "Path"))),
                     title=f"[bold {THEME}]{title}[/]",
                     border_style=THEME,
                 )
@@ -7652,18 +4427,19 @@ class STM32Agent:
 
     # ── UI ──────────────────────────────────────────────────
     def _print_header(self):
+        ctx = get_context()
         chip_line = _cli_text(
-            f"芯片: [bold]{_current_chip}[/]  |  模型: [bold]{AI_MODEL}[/]",
-            f"Chip: [bold]{_current_chip}[/]  |  Model: [bold]{AI_MODEL}[/]",
+            f"芯片: [bold]{ctx.chip}[/]  |  模型: [bold]{AI_MODEL}[/]",
+            f"Chip: [bold]{ctx.chip}[/]  |  Model: [bold]{AI_MODEL}[/]",
         )
         hw_line = (
             _cli_text(
-                f"硬件: [green]已连接[/]  串口: [{'green' if _serial_connected else 'yellow'}]"
-                f"{'已连接' if _serial_connected else '未连接'}[/]",
-                f"Hardware: [green]connected[/]  Serial: [{'green' if _serial_connected else 'yellow'}]"
-                f"{'connected' if _serial_connected else 'disconnected'}[/]",
+                f"硬件: [green]已连接[/]  串口: [{'green' if ctx.serial_connected else 'yellow'}]"
+                f"{'已连接' if ctx.serial_connected else '未连接'}[/]",
+                f"Hardware: [green]connected[/]  Serial: [{'green' if ctx.serial_connected else 'yellow'}]"
+                f"{'connected' if ctx.serial_connected else 'disconnected'}[/]",
             )
-            if _hw_connected
+            if ctx.hw_connected
             else _cli_text("硬件: [dim]未连接[/]", "Hardware: [dim]disconnected[/]")
         )
         art = (
@@ -7762,9 +4538,10 @@ class STM32Agent:
 
     def _status_bar(self):
         tokens = self._tokens()
+        ctx = get_context()
         hw = (
-            f"[green]●[/] {_current_chip}"
-            if _hw_connected
+            f"[green]●[/] {ctx.chip}"
+            if ctx.hw_connected
             else _cli_text("[dim]○ 未连接[/]", "[dim]○ Disconnected[/]")
         )
         CONSOLE.print(
@@ -7810,11 +4587,36 @@ class STM32Agent:
                 break
 
 
+def _configure_telegram_runtime() -> None:
+    """Register stm32_agent runtime hooks for the Telegram integration."""
+
+    configure_telegram_integration(
+        console=CONSOLE,
+        cli_text=_cli_text,
+        is_ai_configured=_ai_is_configured,
+        configure_ai_cli=lambda: configure_ai_cli(),
+        agent_factory=lambda interactive=False: STM32Agent(interactive=interactive),
+        hardware_status=stm32_hardware_status,
+        connect=stm32_connect,
+        disconnect=stm32_disconnect,
+        set_chip=stm32_set_chip,
+        list_projects=stm32_list_projects,
+        detect_serial_ports=detect_serial_ports,
+        serial_connect=stm32_serial_connect,
+        get_current_chip=lambda: get_context().chip or "(未设置)",
+        script_path=_HERE / "stm32_agent.py",
+        workdir=_HERE,
+    )
+
+
+_configure_telegram_runtime()
+
+
 # ─────────────────────────────────────────────────────────────
 # 入口
 # ─────────────────────────────────────────────────────────────
 def main():
-    global _current_chip
+    ctx = get_context()
 
     # 命令行参数
     args = sys.argv[1:]
@@ -7841,14 +4643,14 @@ def main():
     if "--chip" in args:
         idx = args.index("--chip")
         if idx + 1 < len(args):
-            _current_chip = args[idx + 1].upper()
+            ctx.chip = args[idx + 1].upper()
 
     # 检查依赖
     CONSOLE.print(f"[dim]{_cli_text('检查环境...', 'Checking environment...')}[/]")
 
     # GCC
     compiler = _get_compiler()
-    ci = compiler.check(_current_chip)
+    ci = compiler.check(ctx.chip)
     if ci.get("gcc"):
         CONSOLE.print(f"[green]  GCC: {ci['gcc_version']}[/]")
     else:
