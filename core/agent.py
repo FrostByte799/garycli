@@ -1,6 +1,6 @@
 """Gary core runtime, agent loop, and CLI orchestration."""
-
 import argparse
+import mimetypes
 import sys, os, json, re, time, shutil, subprocess, threading, shlex
 from pathlib import Path
 from datetime import datetime
@@ -24,7 +24,10 @@ from ai.client import (
     _read_ai_config,
     _write_ai_config,
     _write_cli_language_config,
+    build_image_message_part,
+    build_vision_message_parts,
     get_ai_client,
+    model_may_support_vision,
     reload_ai_config,
     stream_chat,
 )
@@ -2815,7 +2818,26 @@ class STM32Agent:
     # ── Token 估算 ──────────────────────────────────────────
     # 替换原来的 _tokens 和 _truncate 方法
     def _tokens(self) -> int:
-        return sum(len(str(m.get("content", ""))) // 3 for m in self.messages)
+        def _estimate_content_tokens(content: Any) -> int:
+            if isinstance(content, str):
+                return max(1, len(content) // 3)
+            if isinstance(content, list):
+                total = 0
+                for part in content:
+                    if not isinstance(part, dict):
+                        total += max(1, len(str(part)) // 3)
+                        continue
+                    part_type = str(part.get("type", "")).lower()
+                    if part_type == "text":
+                        total += max(1, len(str(part.get("text", ""))) // 3)
+                    elif part_type == "image_url":
+                        total += 512
+                    else:
+                        total += max(1, len(str(part)) // 3)
+                return total
+            return max(1, len(str(content)) // 3)
+
+        return sum(_estimate_content_tokens(m.get("content", "")) for m in self.messages)
 
     def _truncate_result(self, s: str, tool_name: str = "") -> str:
         """针对不同工具结果使用不同截断策略"""
@@ -2983,6 +3005,205 @@ class STM32Agent:
         return "\n".join(lines)
 
     # ── 流式响应 + 工具调用 ─────────────────────────────────
+    def _resolve_image_path(self, file_path: str) -> Path:
+        """Resolve a local image path and validate it."""
+
+        path = Path(file_path.strip().strip('"')).expanduser()
+        if not path.is_absolute():
+            path = (_PROJECT_ROOT / path).resolve()
+        else:
+            path = path.resolve()
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"图片不存在: {path}")
+        mime = mimetypes.guess_type(path.name)[0] or ""
+        if not mime.startswith("image/"):
+            raise ValueError(f"不是图片文件: {path}")
+        return path
+
+    def _resolve_pdf_path(self, file_path: str) -> Path:
+        """Resolve a local PDF path and validate it."""
+
+        path = Path(file_path.strip().strip('"')).expanduser()
+        if not path.is_absolute():
+            path = (_PROJECT_ROOT / path).resolve()
+        else:
+            path = path.resolve()
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"PDF 不存在: {path}")
+        if path.suffix.lower() != ".pdf":
+            raise ValueError(f"不是 PDF 文件: {path}")
+        return path
+
+    def _extract_pdf_text(self, pdf_path: Path, max_chars: int = 40000) -> dict[str, Any]:
+        """Extract text from a PDF using available local backends."""
+
+        text_parts: list[str] = []
+        page_count = 0
+        backend = ""
+        truncated = False
+
+        try:
+            import fitz  # type: ignore
+
+            backend = "pymupdf"
+            with fitz.open(pdf_path) as doc:
+                page_count = len(doc)
+                for index, page in enumerate(doc):
+                    page_text = (page.get_text("text") or "").strip()
+                    if page_text:
+                        text_parts.append(f"\n[Page {index + 1}]\n{page_text}")
+                    if sum(len(part) for part in text_parts) >= max_chars:
+                        truncated = True
+                        break
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader  # type: ignore
+
+                backend = "pypdf2"
+                reader = PdfReader(str(pdf_path))
+                page_count = len(reader.pages)
+                for index, page in enumerate(reader.pages):
+                    page_text = (page.extract_text() or "").strip()
+                    if page_text:
+                        text_parts.append(f"\n[Page {index + 1}]\n{page_text}")
+                    if sum(len(part) for part in text_parts) >= max_chars:
+                        truncated = True
+                        break
+            except Exception as exc:
+                return {"success": False, "message": f"无法提取 PDF 文字: {exc}"}
+
+        text = "\n".join(text_parts).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars]
+            truncated = True
+        return {
+            "success": True,
+            "text": text,
+            "page_count": page_count,
+            "backend": backend,
+            "truncated": truncated,
+            "has_text": bool(text.strip()),
+        }
+
+    def _render_pdf_pages_to_images(
+        self,
+        pdf_path: Path,
+        *,
+        max_pages: int = 5,
+    ) -> dict[str, Any]:
+        """Render the first PDF pages to PNG files for vision analysis."""
+
+        try:
+            import fitz  # type: ignore
+        except Exception as exc:
+            return {"success": False, "message": f"扫描版 PDF 需要 PyMuPDF: {exc}"}
+
+        out_dir = GARY_HOME / "pdf_previews" / f"{pdf_path.stem}_{int(time.time())}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image_paths: list[Path] = []
+        try:
+            with fitz.open(pdf_path) as doc:
+                page_count = len(doc)
+                for index in range(min(page_count, max_pages)):
+                    page = doc.load_page(index)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    out_path = out_dir / f"page_{index + 1}.png"
+                    pix.save(out_path)
+                    image_paths.append(out_path)
+        except Exception as exc:
+            return {"success": False, "message": f"PDF 转图片失败: {exc}"}
+
+        return {
+            "success": True,
+            "image_paths": image_paths,
+            "page_count": page_count,
+            "rendered_pages": len(image_paths),
+        }
+
+    def analyze_image(self, file_path: str, prompt: str = "", stream_to_console: bool = True) -> str:
+        """Analyze a local image by sending it as a multimodal user turn."""
+
+        path = self._resolve_image_path(file_path)
+        user_prompt = prompt.strip() or _cli_text(
+            "请分析这张图片的内容，提取文字，并说明关键元素、界面状态或硬件现象。",
+            "Analyze this image, extract any visible text, and describe the key visual elements.",
+        )
+        if self.interactive and not model_may_support_vision(AI_MODEL):
+            CONSOLE.print(
+                f"[yellow]{_cli_text('提示：当前模型名看起来不一定支持读图，但仍会按通用多模态格式尝试。', 'Note: the current model name may not be vision-capable, but Gary will still send a standard multimodal request.')}[/]"
+        )
+        self._truncate_history()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": build_vision_message_parts(path, user_prompt),
+            }
+        )
+        return self.chat("", stream_to_console=stream_to_console)
+
+    def analyze_pdf(self, file_path: str, prompt: str = "", stream_to_console: bool = True) -> str:
+        """Analyze a PDF using text extraction first, then vision fallback for scanned PDFs."""
+
+        path = self._resolve_pdf_path(file_path)
+        user_prompt = prompt.strip() or _cli_text(
+            "请阅读这份 PDF，提取关键信息并给出结构化总结。",
+            "Read this PDF, extract the key information, and provide a structured summary.",
+        )
+
+        extracted = self._extract_pdf_text(path)
+        if extracted.get("success") and extracted.get("has_text"):
+            extracted_text = str(extracted.get("text", "")).strip()
+            meta = (
+                f"PDF: {path.name}\n"
+                f"Pages: {extracted.get('page_count', '?')}\n"
+                f"Backend: {extracted.get('backend', '?')}\n"
+            )
+            if extracted.get("truncated"):
+                meta += _cli_text(
+                    "注意：提取文本过长，已截断到前一部分内容。\n",
+                    "Note: extracted text was truncated to the earlier portion.\n",
+                )
+            self._truncate_history()
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{user_prompt}\n\n"
+                        f"{meta}\n"
+                        f"Extracted PDF text:\n```text\n{extracted_text}\n```"
+                    ),
+                }
+            )
+            return self.chat("", stream_to_console=stream_to_console)
+
+        rendered = self._render_pdf_pages_to_images(path)
+        if not rendered.get("success"):
+            raise RuntimeError(
+                rendered.get("message")
+                or extracted.get("message")
+                or "无法读取这个 PDF"
+            )
+        if self.interactive and not model_may_support_vision(AI_MODEL):
+            CONSOLE.print(
+                f"[yellow]{_cli_text('提示：当前模型名看起来不一定支持读图，但扫描版 PDF 仍会按通用多模态格式尝试。', 'Note: the current model name may not be vision-capable, but scanned PDF pages will still be sent as standard multimodal input.')}[/]"
+            )
+        image_paths = rendered.get("image_paths", [])
+        content_parts = [build_image_message_part(image_path) for image_path in image_paths]
+        content_parts.append(
+            {
+                "type": "text",
+                "text": (
+                    f"{user_prompt}\n\n"
+                    f"这是一个扫描版或无文字层的 PDF。"
+                    f" 当前共 {rendered.get('page_count', '?')} 页，"
+                    f" 已提供前 {rendered.get('rendered_pages', 0)} 页图像用于分析。"
+                ),
+            }
+        )
+        self._truncate_history()
+        self.messages.append({"role": "user", "content": content_parts})
+        return self.chat("", stream_to_console=stream_to_console)
+
     def chat(
         self,
         user_input: str,
@@ -2990,8 +3211,9 @@ class STM32Agent:
         text_callback=None,
         tool_callback=None,
     ) -> str:
-        self._truncate_history()
-        self.messages.append({"role": "user", "content": user_input})
+        if user_input:
+            self._truncate_history()
+            self.messages.append({"role": "user", "content": user_input})
         reply_parts: List[str] = []
         tool_summaries: List[str] = []
         used_tools = False
