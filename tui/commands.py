@@ -1,7 +1,7 @@
 """Slash command handling and prompt completions for the TUI."""
 
 from __future__ import annotations
-
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -34,6 +34,8 @@ class GaryCompleter(Completer):
 
     COMMANDS = (
         "/help",
+        "/vision",
+        "/pdf",
         "/connect",
         "/disconnect",
         "/serial",
@@ -229,6 +231,20 @@ def _show_help(theme: str, cli_text: Callable[[str, str], str]) -> None:
     table.add_column(cli_text("说明", "Description"), style="white")
     cmds = [
         (
+            '/vision "C:\\path\\image.png" [补充说明]',
+            cli_text(
+                '读取并分析本地图片；也支持把图片直接拖进终端自动识别',
+                'Read and analyze a local image; dragging an image into the terminal also works',
+            ),
+        ),
+        (
+            '/pdf "C:\\path\\file.pdf" [补充说明]',
+            cli_text(
+                '读取 PDF：有文字层时会先抽文本，扫描版会自动按页转图分析',
+                'Read a PDF: text PDFs extract text first, scanned PDFs fall back to page-image analysis',
+            ),
+        ),
+        (
             "/connect [chip]",
             cli_text(
                 "连接探针（如 /connect STM32F103C8T6）",
@@ -321,8 +337,51 @@ def handle_slash_command(
     head = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
+    def _parse_media_args(raw: str) -> tuple[str, str] | None:
+        if not raw.strip():
+            return None
+        try:
+            tokens = shlex.split(raw, posix=False)
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        return tokens[0].strip().strip('"'), " ".join(tokens[1:]).strip()
+
     if head in ("/help", "?"):
         _show_help(theme, cli_text)
+        return True
+
+    if head == "/vision":
+        parsed = _parse_media_args(arg)
+        if parsed is None:
+            usage = cli_text(
+                '用法: /vision "C:\\path\\image.png" [补充说明]',
+                'Usage: /vision "C:\\path\\image.png" [extra prompt]',
+            )
+            console.print(f"[yellow]{usage}[/]\n")
+            return True
+        path, prompt = parsed
+        try:
+            agent.analyze_image(path, prompt=prompt, stream_to_console=True)
+        except Exception as exc:
+            console.print(f"[red]{exc}[/]\n")
+        return True
+
+    if head == "/pdf":
+        parsed = _parse_media_args(arg)
+        if parsed is None:
+            usage = cli_text(
+                '用法: /pdf "C:\\path\\file.pdf" [补充说明]',
+                'Usage: /pdf "C:\\path\\file.pdf" [extra prompt]',
+            )
+            console.print(f"[yellow]{usage}[/]\n")
+            return True
+        path, prompt = parsed
+        try:
+            agent.analyze_pdf(path, prompt=prompt, stream_to_console=True)
+        except Exception as exc:
+            console.print(f"[red]{exc}[/]\n")
         return True
 
     if head == "/connect":
