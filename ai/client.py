@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import importlib
 import json
+import mimetypes
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -56,6 +58,22 @@ REGISTER_READ_DELAY = getattr(_cfg, "REGISTER_READ_DELAY", 0.3)
 
 _AI_CLIENT: Any | None = None
 _AI_CLIENT_SIGNATURE: tuple[str, str, float] | None = None
+_VISION_MODEL_HINTS = (
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4.5",
+    "o1",
+    "o3",
+    "vision",
+    "vl",
+    "gemini",
+    "kimi",
+    "qwen-vl",
+    "glm-4v",
+    "internvl",
+    "llava",
+    "minicpm-v",
+)
 
 
 def _load_openai_class() -> Any | None:
@@ -260,6 +278,43 @@ def get_ai_client(timeout: float = 180.0, force_reload: bool = False) -> Any | N
     return _AI_CLIENT
 
 
+def model_may_support_vision(model: Optional[str] = None) -> bool:
+    """Return whether the configured model name looks vision-capable."""
+
+    name = str(model or AI_MODEL or "").strip().lower()
+    if not name:
+        return False
+    return any(hint in name for hint in _VISION_MODEL_HINTS)
+
+
+def build_image_message_part(image_path: str | Path) -> dict[str, Any]:
+    """Build an OpenAI-compatible image content part from a local image path."""
+
+    path = Path(image_path).expanduser().resolve()
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        raise ValueError(f"Unsupported image MIME type: {mime}")
+    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:{mime};base64,{image_b64}",
+        },
+    }
+
+
+def build_vision_message_parts(image_path: str | Path, prompt: str) -> list[dict[str, Any]]:
+    """Build a provider-agnostic OpenAI-compatible multimodal user content payload."""
+
+    return [
+        build_image_message_part(image_path),
+        {
+            "type": "text",
+            "text": prompt,
+        },
+    ]
+
+
 def stream_chat(
     *,
     messages: list[dict[str, Any]],
@@ -307,7 +362,10 @@ __all__ = [
     "_reload_ai_globals",
     "_write_ai_config",
     "_write_cli_language_config",
+    "build_image_message_part",
+    "build_vision_message_parts",
     "get_ai_client",
+    "model_may_support_vision",
     "reload_ai_config",
     "stream_chat",
 ]
