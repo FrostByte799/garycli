@@ -233,15 +233,15 @@ def _show_help(theme: str, cli_text: Callable[[str, str], str]) -> None:
         (
             '/vision "C:\\path\\image.png" [补充说明]',
             cli_text(
-                '读取并分析本地图片；也支持把图片直接拖进终端自动识别',
-                'Read and analyze a local image; dragging an image into the terminal also works',
+                "读取并分析本地图片；也支持把图片直接拖进终端自动识别",
+                "Read and analyze a local image; dragging an image into the terminal also works",
             ),
         ),
         (
             '/pdf "C:\\path\\file.pdf" [补充说明]',
             cli_text(
-                '读取 PDF：有文字层时会先抽文本，扫描版会自动按页转图分析',
-                'Read a PDF: text PDFs extract text first, scanned PDFs fall back to page-image analysis',
+                "读取 PDF：有文字层时会先抽文本，扫描版会自动按页转图分析",
+                "Read a PDF: text PDFs extract text first, scanned PDFs fall back to page-image analysis",
             ),
         ),
         (

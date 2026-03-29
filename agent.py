@@ -1,4 +1,5 @@
 """Gary core runtime, agent loop, and CLI orchestration."""
+
 import argparse
 import mimetypes
 import sys, os, json, re, time, shutil, subprocess, threading, shlex
@@ -3120,7 +3121,9 @@ class STM32Agent:
             "rendered_pages": len(image_paths),
         }
 
-    def analyze_image(self, file_path: str, prompt: str = "", stream_to_console: bool = True) -> str:
+    def analyze_image(
+        self, file_path: str, prompt: str = "", stream_to_console: bool = True
+    ) -> str:
         """Analyze a local image by sending it as a multimodal user turn."""
 
         path = self._resolve_image_path(file_path)
@@ -3131,7 +3134,7 @@ class STM32Agent:
         if self.interactive and not model_may_support_vision(AI_MODEL):
             CONSOLE.print(
                 f"[yellow]{_cli_text('提示：当前模型名看起来不一定支持读图，但仍会按通用多模态格式尝试。', 'Note: the current model name may not be vision-capable, but Gary will still send a standard multimodal request.')}[/]"
-        )
+            )
         self._truncate_history()
         self.messages.append(
             {
@@ -3179,9 +3182,7 @@ class STM32Agent:
         rendered = self._render_pdf_pages_to_images(path)
         if not rendered.get("success"):
             raise RuntimeError(
-                rendered.get("message")
-                or extracted.get("message")
-                or "无法读取这个 PDF"
+                rendered.get("message") or extracted.get("message") or "无法读取这个 PDF"
             )
         if self.interactive and not model_may_support_vision(AI_MODEL):
             CONSOLE.print(
