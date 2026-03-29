@@ -33,6 +33,80 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 console = Console()
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+_PDF_SUFFIXES = {".pdf"}
+
+
+def _split_dragged_image_input(user_input: str) -> Optional[tuple[Path, str]]:
+    """Split a dragged image path and any trailing prompt text from terminal input."""
+
+    raw = (user_input or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    if raw.startswith('"'):
+        closing = raw.find('"', 1)
+        if closing > 1:
+            candidates.append((raw[1:closing], raw[closing + 1 :].strip()))
+    if not candidates:
+        for suffix in _IMAGE_SUFFIXES:
+            marker = suffix
+            index = raw.lower().find(marker)
+            if index >= 0:
+                end = index + len(marker)
+                candidates.append((raw[:end].strip().strip('"'), raw[end:].strip()))
+
+    for path_text, prompt in candidates:
+        if not path_text:
+            continue
+        candidate = Path(path_text).expanduser()
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        if resolved.suffix.lower() not in _IMAGE_SUFFIXES:
+            continue
+        return resolved, prompt
+    return None
+
+
+def _split_dragged_pdf_input(user_input: str) -> Optional[tuple[Path, str]]:
+    """Split a dragged PDF path and any trailing prompt text from terminal input."""
+
+    raw = (user_input or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    if raw.startswith('"'):
+        closing = raw.find('"', 1)
+        if closing > 1:
+            candidates.append((raw[1:closing], raw[closing + 1 :].strip()))
+    if not candidates:
+        marker = ".pdf"
+        index = raw.lower().find(marker)
+        if index >= 0:
+            end = index + len(marker)
+            candidates.append((raw[:end].strip().strip('"'), raw[end:].strip()))
+
+    for path_text, prompt in candidates:
+        if not path_text:
+            continue
+        candidate = Path(path_text).expanduser()
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        if resolved.suffix.lower() not in _PDF_SUFFIXES:
+            continue
+        return resolved, prompt
+    return None
+
 
 def print_banner(
     *,
@@ -177,6 +251,30 @@ def run_interactive(
                 continue
             if user_input.startswith("/") or user_input.strip() == "?":
                 handle_command(agent, user_input.strip())
+                continue
+            dragged_image = _split_dragged_image_input(user_input)
+            if dragged_image is not None:
+                image_path, image_prompt = dragged_image
+                try:
+                    agent.analyze_image(
+                        str(image_path),
+                        prompt=image_prompt,
+                        stream_to_console=True,
+                    )
+                except Exception as exc:
+                    console.print(f"[red]{exc}[/]\n")
+                continue
+            dragged_pdf = _split_dragged_pdf_input(user_input)
+            if dragged_pdf is not None:
+                pdf_path, pdf_prompt = dragged_pdf
+                try:
+                    agent.analyze_pdf(
+                        str(pdf_path),
+                        prompt=pdf_prompt,
+                        stream_to_console=True,
+                    )
+                except Exception as exc:
+                    console.print(f"[red]{exc}[/]\n")
                 continue
             agent.chat(user_input)
         except KeyboardInterrupt:
